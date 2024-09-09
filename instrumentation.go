@@ -28,6 +28,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 
+	"go.opentelemetry.io/auto/config"
 	"go.opentelemetry.io/auto/internal/pkg/instrumentation"
 	"go.opentelemetry.io/auto/internal/pkg/opentelemetry"
 	"go.opentelemetry.io/auto/internal/pkg/process"
@@ -74,11 +75,11 @@ func newLogger(logLevel LogLevel) logr.Logger {
 		level, _ = zap.ParseAtomicLevel(LogLevelInfo.String())
 	}
 
-	config := zap.NewProductionConfig()
+	c := zap.NewProductionConfig()
 
-	config.Level.SetLevel(level.Level())
+	c.Level.SetLevel(level.Level())
 
-	zapLog, err := config.Build()
+	zapLog, err := c.Build()
 
 	var logger logr.Logger
 	if err != nil {
@@ -130,7 +131,7 @@ func NewInstrumentation(ctx context.Context, opts ...InstrumentationOption) (*In
 		return nil, err
 	}
 
-	mngr, err := instrumentation.NewManager(logger, ctrl, c.globalImpl, c.loadIndicator)
+	mngr, err := instrumentation.NewManager(logger, ctrl, c.globalImpl, c.loadIndicator, c.cp)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +214,6 @@ type InstrumentationOption interface {
 }
 
 type instConfig struct {
-	sampler            trace.Sampler
 	traceExp           trace.SpanExporter
 	target             process.TargetArgs
 	serviceName        string
@@ -221,6 +221,8 @@ type instConfig struct {
 	globalImpl         bool
 	loadIndicator      chan struct{}
 	logLevel           LogLevel
+	sampler            config.Sampler
+	cp                 config.Provider
 }
 
 func newInstConfig(ctx context.Context, opts []InstrumentationOption) (instConfig, error) {
@@ -248,11 +250,15 @@ func newInstConfig(ctx context.Context, opts []InstrumentationOption) (instConfi
 	}
 
 	if c.sampler == nil {
-		c.sampler = trace.AlwaysSample()
+		c.sampler = config.DefaultSampler()
 	}
 
 	if c.logLevel == logLevelUndefined {
 		c.logLevel = LogLevelInfo
+	}
+
+	if c.cp == nil {
+		c.cp = config.NewNoopProvider(c.sampler)
 	}
 
 	return c, err
@@ -279,7 +285,9 @@ func (c instConfig) validate() error {
 
 func (c instConfig) tracerProvider(bi *buildinfo.BuildInfo) *trace.TracerProvider {
 	return trace.NewTracerProvider(
-		trace.WithSampler(c.sampler),
+		// the actual sampling is done in the eBPF probes.
+		// this is just to make sure that we export all spans we get from the probes
+		trace.WithSampler(trace.AlwaysSample()),
 		trace.WithResource(c.res(bi)),
 		trace.WithBatcher(c.traceExp),
 		trace.WithIDGenerator(opentelemetry.NewEBPFSourceIDGenerator()),
@@ -395,9 +403,11 @@ var lookupEnv = os.LookupEnv
 //   - OTEL_TRACES_EXPORTER: sets the trace exporter
 //   - OTEL_GO_AUTO_GLOBAL: enables the OpenTelemetry global implementation
 //   - OTEL_LOG_LEVEL: sets the log level
+//   - OTEL_TRACES_SAMPLER: sets the trace sampler
+//   - OTEL_TRACES_SAMPLER_ARG: optionally sets the trace sampler argument
 //
 // This option may conflict with [WithTarget], [WithPID], [WithTraceExporter],
-// [WithServiceName], [WithGlobal] and [WithLogLevel] if their respective environment variable is defined.
+// [WithServiceName], [WithGlobal], [WithLogLevel] and [WithSampler] if their respective environment variable is defined.
 // If more than one of these options are used, the last one provided to an
 // [Instrumentation] will be used.
 //
@@ -440,6 +450,11 @@ func WithEnv() InstrumentationOption {
 			}
 
 			err = errors.Join(err, e)
+		}
+		if s, e := config.NewSamplerFromEnv(lookupEnv); e != nil {
+			err = errors.Join(err, e)
+		} else {
+			c.sampler = s
 		}
 		return c, err
 	})
@@ -494,7 +509,7 @@ func WithTraceExporter(exp trace.SpanExporter) InstrumentationOption {
 
 // WithSampler returns an [InstrumentationOption] that will configure
 // an [Instrumentation] to use the provided sampler to sample OpenTelemetry traces.
-func WithSampler(sampler trace.Sampler) InstrumentationOption {
+func WithSampler(sampler config.Sampler) InstrumentationOption {
 	return fnOpt(func(_ context.Context, c instConfig) (instConfig, error) {
 		c.sampler = sampler
 		return c, nil
@@ -559,6 +574,17 @@ func WithLogLevel(level LogLevel) InstrumentationOption {
 
 		c.logLevel = level
 
+		return c, nil
+	})
+}
+
+// WithConfigProvider returns an [InstrumentationOption] that will configure
+// an [Instrumentation] to use the provided config.Provider. The config.Provider
+// is used to provide the initial configuration and update the configuration of
+// the instrumentation in runtime.
+func WithConfigProvider(cp config.Provider) InstrumentationOption {
+	return fnOpt(func(_ context.Context, c instConfig) (instConfig, error) {
+		c.cp = cp
 		return c, nil
 	})
 }
