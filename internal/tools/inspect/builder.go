@@ -6,29 +6,33 @@ package inspect
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
+	"os"
 	"path/filepath"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/go-logr/logr"
-	"github.com/hashicorp/go-version"
 )
 
 // minCompatVer is the min "go mod" version that includes the "compat" option.
-var minCompatVer = version.Must(version.NewVersion("1.17.0"))
+var minCompatVer = semver.New(1, 17, 0, "", "")
 
 // builder builds a Go application into a binary using Docker.
 type builder struct {
-	log logr.Logger
+	log *slog.Logger
 	cli *client.Client
 
-	goVer   *version.Version
+	goVer   *semver.Version
 	GoImage string
 }
 
@@ -38,16 +42,16 @@ type builder struct {
 //
 // If goVer is nil, the latest version of the Go docker container will be used
 // to build applications.
-func newBuilder(l logr.Logger, cli *client.Client, goVer *version.Version) *builder {
+func newBuilder(l *slog.Logger, cli *client.Client, goVer *semver.Version) *builder {
 	img := "golang:latest"
 	if goVer != nil {
 		// Use goVer.String here so 1.12 means 1.12.0. If Original is used, it
 		// would mean that the 1.12.17 docker image (which is tagged as the
 		// latest "1.12" release) would be used.
-		img = fmt.Sprintf("golang:%s", goVer.String())
+		img = "golang:" + goVer.String()
 	}
 	return &builder{
-		log:     l.WithName("builder"),
+		log:     l,
 		cli:     cli,
 		goVer:   goVer,
 		GoImage: img,
@@ -55,10 +59,15 @@ func newBuilder(l logr.Logger, cli *client.Client, goVer *version.Version) *buil
 }
 
 // Build builds the appV version of a Go application located in dir.
-func (b *builder) Build(ctx context.Context, dir string, appV *version.Version, modName string) (string, error) {
-	b.log.V(2).Info("building application...", "version", appV, "dir", dir, "image", b.GoImage)
+func (b *builder) Build(
+	ctx context.Context,
+	dir string,
+	appV *semver.Version,
+	modName string,
+) (string, error) {
+	b.log.Debug("building application...", "version", appV, "dir", dir, "image", b.GoImage)
 
-	app := fmt.Sprintf("app%s", appV.Original())
+	app := "app" + appV.Original()
 	goGetCmd := fmt.Sprintf("go get %s@%s", modName, appV.Original())
 	goModTidyCmd := "go mod tidy -compat=1.17"
 	var cmd string
@@ -77,12 +86,12 @@ func (b *builder) Build(ctx context.Context, dir string, appV *version.Version, 
 		return "", err
 	}
 
-	b.log.V(1).Info("built application", "version", appV, "dir", dir, "image", b.GoImage)
+	b.log.Debug("built application", "version", appV, "dir", dir, "image", b.GoImage)
 	return filepath.Join(dir, app), nil
 }
 
 func (b *builder) runCmd(ctx context.Context, cmd []string, dir string) error {
-	b.log.V(2).Info("running command...", "cmd", cmd, "dir", dir, "image", b.GoImage)
+	b.log.Debug("running command...", "cmd", cmd, "dir", dir, "image", b.GoImage)
 
 	err := b.pullImage(ctx)
 	if err != nil {
@@ -108,11 +117,27 @@ func (b *builder) pullImage(ctx context.Context) error {
 		return err
 	}
 	if len(summaries) > 0 {
-		b.log.V(2).Info("using local image", "image", b.GoImage)
+		b.log.Debug("using local image", "image", b.GoImage)
 		return nil
 	}
 
-	rc, err := b.cli.ImagePull(ctx, b.GoImage, image.PullOptions{})
+	pullOpts := image.PullOptions{}
+	username := os.Getenv("DOCKER_USERNAME")
+	password := os.Getenv("DOCKER_PASSWORD")
+	if username != "" && password != "" {
+		authConfig := registry.AuthConfig{
+			Username: username,
+			Password: password,
+		}
+		encodedJSON, err := json.Marshal(authConfig)
+		if err != nil {
+			panic(err)
+		}
+		authStr := base64.URLEncoding.EncodeToString(encodedJSON)
+		pullOpts.RegistryAuth = authStr
+	}
+
+	rc, err := b.cli.ImagePull(ctx, b.GoImage, pullOpts)
 	if err != nil {
 		return err
 	}
@@ -120,7 +145,7 @@ func (b *builder) pullImage(ctx context.Context) error {
 
 	out := new(bytes.Buffer)
 	_, err = io.Copy(out, rc)
-	b.log.V(1).Info("pulling image", "image", b.GoImage, "output", out.String())
+	b.log.Debug("pulling image", "image", b.GoImage, "output", out.String())
 	return err
 }
 

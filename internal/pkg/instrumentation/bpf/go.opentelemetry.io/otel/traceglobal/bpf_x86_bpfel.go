@@ -8,22 +8,31 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type bpfOtelSpanT struct {
+	_         structs.HostLayout
+	Kind      uint64
 	StartTime uint64
 	EndTime   uint64
 	Sc        bpfSpanContext
 	Psc       bpfSpanContext
 	SpanName  bpfSpanNameT
 	Status    struct {
+		_           structs.HostLayout
 		Code        uint32
-		Description struct{ Buf [64]int8 }
+		Description struct {
+			_   structs.HostLayout
+			Buf [64]int8
+		}
 	}
 	Attributes struct {
+		_     structs.HostLayout
 		Attrs [16]struct {
+			_         structs.HostLayout
 			ValLength uint16
 			Vtype     uint8
 			Reserved  uint8
@@ -36,18 +45,26 @@ type bpfOtelSpanT struct {
 	_        [3]byte
 }
 
-type bpfSliceArrayBuff struct{ Buff [1024]uint8 }
+type bpfSliceArrayBuff struct {
+	_    structs.HostLayout
+	Buff [1024]uint8
+}
 
 type bpfSpanContext struct {
+	_          structs.HostLayout
 	TraceID    [16]uint8
 	SpanID     [8]uint8
 	TraceFlags uint8
 	Padding    [7]uint8
 }
 
-type bpfSpanNameT struct{ Buf [64]int8 }
+type bpfSpanNameT struct {
+	_   structs.HostLayout
+	Buf [64]int8
+}
 
 type bpfTracerIdT struct {
+	_         structs.HostLayout
 	Name      [128]int8
 	Version   [32]int8
 	SchemaUrl [128]int8
@@ -88,9 +105,10 @@ func loadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type bpfSpecs struct {
 	bpfProgramSpecs
 	bpfMapSpecs
+	bpfVariableSpecs
 }
 
-// bpfSpecs contains programs before they are loaded into the kernel.
+// bpfProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
@@ -100,6 +118,7 @@ type bpfProgramSpecs struct {
 	UprobeSetStatus     *ebpf.ProgramSpec `ebpf:"uprobe_SetStatus"`
 	UprobeStart         *ebpf.ProgramSpec `ebpf:"uprobe_Start"`
 	UprobeStartReturns  *ebpf.ProgramSpec `ebpf:"uprobe_Start_Returns"`
+	UprobeNewStart      *ebpf.ProgramSpec `ebpf:"uprobe_newStart"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
@@ -112,6 +131,8 @@ type bpfMapSpecs struct {
 	GoContextToSc             *ebpf.MapSpec `ebpf:"go_context_to_sc"`
 	GolangMapbucketStorageMap *ebpf.MapSpec `ebpf:"golang_mapbucket_storage_map"`
 	OtelSpanStorageMap        *ebpf.MapSpec `ebpf:"otel_span_storage_map"`
+	ProbeActiveSamplerMap     *ebpf.MapSpec `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap         *ebpf.MapSpec `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap         *ebpf.MapSpec `ebpf:"slice_array_buff_map"`
 	SpanNameByContext         *ebpf.MapSpec `ebpf:"span_name_by_context"`
 	TracerIdByContext         *ebpf.MapSpec `ebpf:"tracer_id_by_context"`
@@ -120,12 +141,40 @@ type bpfMapSpecs struct {
 	TrackedSpansBySc          *ebpf.MapSpec `ebpf:"tracked_spans_by_sc"`
 }
 
+// bpfVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type bpfVariableSpecs struct {
+	AttrTypeBool                    *ebpf.VariableSpec `ebpf:"attr_type_bool"`
+	AttrTypeBoolslice               *ebpf.VariableSpec `ebpf:"attr_type_boolslice"`
+	AttrTypeFloat64                 *ebpf.VariableSpec `ebpf:"attr_type_float64"`
+	AttrTypeFloat64slice            *ebpf.VariableSpec `ebpf:"attr_type_float64slice"`
+	AttrTypeInt64                   *ebpf.VariableSpec `ebpf:"attr_type_int64"`
+	AttrTypeInt64slice              *ebpf.VariableSpec `ebpf:"attr_type_int64slice"`
+	AttrTypeInvalid                 *ebpf.VariableSpec `ebpf:"attr_type_invalid"`
+	AttrTypeString                  *ebpf.VariableSpec `ebpf:"attr_type_string"`
+	AttrTypeStringslice             *ebpf.VariableSpec `ebpf:"attr_type_stringslice"`
+	BucketsPtrPos                   *ebpf.VariableSpec `ebpf:"buckets_ptr_pos"`
+	EndAddr                         *ebpf.VariableSpec `ebpf:"end_addr"`
+	Hex                             *ebpf.VariableSpec `ebpf:"hex"`
+	StartAddr                       *ebpf.VariableSpec `ebpf:"start_addr"`
+	TotalCpus                       *ebpf.VariableSpec `ebpf:"total_cpus"`
+	TracerDelegatePos               *ebpf.VariableSpec `ebpf:"tracer_delegate_pos"`
+	TracerIdContainsSchemaURL       *ebpf.VariableSpec `ebpf:"tracer_id_contains_schemaURL"`
+	TracerIdContainsScopeAttributes *ebpf.VariableSpec `ebpf:"tracer_id_contains_scope_attributes"`
+	TracerNamePos                   *ebpf.VariableSpec `ebpf:"tracer_name_pos"`
+	TracerProviderPos               *ebpf.VariableSpec `ebpf:"tracer_provider_pos"`
+	TracerProviderTracersPos        *ebpf.VariableSpec `ebpf:"tracer_provider_tracers_pos"`
+	WroteFlag                       *ebpf.VariableSpec `ebpf:"wrote_flag"`
+}
+
 // bpfObjects contains all objects after they have been loaded into the kernel.
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfObjects struct {
 	bpfPrograms
 	bpfMaps
+	bpfVariables
 }
 
 func (o *bpfObjects) Close() error {
@@ -145,6 +194,8 @@ type bpfMaps struct {
 	GoContextToSc             *ebpf.Map `ebpf:"go_context_to_sc"`
 	GolangMapbucketStorageMap *ebpf.Map `ebpf:"golang_mapbucket_storage_map"`
 	OtelSpanStorageMap        *ebpf.Map `ebpf:"otel_span_storage_map"`
+	ProbeActiveSamplerMap     *ebpf.Map `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap         *ebpf.Map `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap         *ebpf.Map `ebpf:"slice_array_buff_map"`
 	SpanNameByContext         *ebpf.Map `ebpf:"span_name_by_context"`
 	TracerIdByContext         *ebpf.Map `ebpf:"tracer_id_by_context"`
@@ -161,6 +212,8 @@ func (m *bpfMaps) Close() error {
 		m.GoContextToSc,
 		m.GolangMapbucketStorageMap,
 		m.OtelSpanStorageMap,
+		m.ProbeActiveSamplerMap,
+		m.SamplersConfigMap,
 		m.SliceArrayBuffMap,
 		m.SpanNameByContext,
 		m.TracerIdByContext,
@@ -168,6 +221,33 @@ func (m *bpfMaps) Close() error {
 		m.TracerPtrToIdMap,
 		m.TrackedSpansBySc,
 	)
+}
+
+// bpfVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfVariables struct {
+	AttrTypeBool                    *ebpf.Variable `ebpf:"attr_type_bool"`
+	AttrTypeBoolslice               *ebpf.Variable `ebpf:"attr_type_boolslice"`
+	AttrTypeFloat64                 *ebpf.Variable `ebpf:"attr_type_float64"`
+	AttrTypeFloat64slice            *ebpf.Variable `ebpf:"attr_type_float64slice"`
+	AttrTypeInt64                   *ebpf.Variable `ebpf:"attr_type_int64"`
+	AttrTypeInt64slice              *ebpf.Variable `ebpf:"attr_type_int64slice"`
+	AttrTypeInvalid                 *ebpf.Variable `ebpf:"attr_type_invalid"`
+	AttrTypeString                  *ebpf.Variable `ebpf:"attr_type_string"`
+	AttrTypeStringslice             *ebpf.Variable `ebpf:"attr_type_stringslice"`
+	BucketsPtrPos                   *ebpf.Variable `ebpf:"buckets_ptr_pos"`
+	EndAddr                         *ebpf.Variable `ebpf:"end_addr"`
+	Hex                             *ebpf.Variable `ebpf:"hex"`
+	StartAddr                       *ebpf.Variable `ebpf:"start_addr"`
+	TotalCpus                       *ebpf.Variable `ebpf:"total_cpus"`
+	TracerDelegatePos               *ebpf.Variable `ebpf:"tracer_delegate_pos"`
+	TracerIdContainsSchemaURL       *ebpf.Variable `ebpf:"tracer_id_contains_schemaURL"`
+	TracerIdContainsScopeAttributes *ebpf.Variable `ebpf:"tracer_id_contains_scope_attributes"`
+	TracerNamePos                   *ebpf.Variable `ebpf:"tracer_name_pos"`
+	TracerProviderPos               *ebpf.Variable `ebpf:"tracer_provider_pos"`
+	TracerProviderTracersPos        *ebpf.Variable `ebpf:"tracer_provider_tracers_pos"`
+	WroteFlag                       *ebpf.Variable `ebpf:"wrote_flag"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
@@ -180,6 +260,7 @@ type bpfPrograms struct {
 	UprobeSetStatus     *ebpf.Program `ebpf:"uprobe_SetStatus"`
 	UprobeStart         *ebpf.Program `ebpf:"uprobe_Start"`
 	UprobeStartReturns  *ebpf.Program `ebpf:"uprobe_Start_Returns"`
+	UprobeNewStart      *ebpf.Program `ebpf:"uprobe_newStart"`
 }
 
 func (p *bpfPrograms) Close() error {
@@ -190,6 +271,7 @@ func (p *bpfPrograms) Close() error {
 		p.UprobeSetStatus,
 		p.UprobeStart,
 		p.UprobeStartReturns,
+		p.UprobeNewStart,
 	)
 }
 

@@ -1,6 +1,6 @@
 # Contributing to opentelemetry-go-instrumentation
 
-The Go Instrumnentation special interest group (SIG) meets regularly. See the
+The Go Instrumentation special interest group (SIG) meets regularly. See the
 OpenTelemetry
 [community](https://github.com/open-telemetry/community)
 repo for information on this and other language SIGs.
@@ -11,7 +11,48 @@ for a summary description of past meetings. To request edit access,
 join the meeting or get in touch on
 [Slack](https://cloud-native.slack.com/archives/C03S01YSAS0).
 
+## Scope
+
+It is important to note what this project is and is not intended to achieve.
+This helps focus development to these intended areas and defines clear
+functional boundaries for the project.
+
+### What this project is
+
+This project aims to provide auto-instrumentation functionality for Go
+applications using eBPF and other process-external technologies. It conforms to
+OpenTelemetry standards and strives to be compatible with that ecosystem.
+
+This project is expected to be wrapped into some runnable executable that will
+further extend the functionality and ergonomics of the project. The `auto/cli`
+package is an example of a wrapping executable and is not apart of this scope.
+
+### What this project is not
+
+* **Process discovery**: This project does not discover nor manage process
+  auto-instrumentation life-cycles. It is expected that this is done external
+  to the `auto` package and the results are passed to any created
+  `Instrumentation`.
+* **Multi-language auto-instrumentation**: This project is focused on
+  instrumentation for the Golang programming language.
+* **Host instrumentation**: This project does not focus on instrumentation for
+  the host or platform running processes.
+
 ## Development
+
+### Update `internal/include/libbpf`
+
+Update using either `make` or the GitHub workflow[^1].
+
+[^1]: TODO: link GitHub workflow.
+
+#### Using `make`
+
+```terminal
+# Optionally, export a version constraint to use.
+$ export LIBBPF_VERSION="< 1.5, >= 1.4.7"
+$ make synclibbpf
+```
 
 ### Compiling the project
 
@@ -25,17 +66,42 @@ In addition, use the latest versions of the following components:
 - `llvm`
 - `make`
 
-Build the Go Automatic Instrumnentation binary by running:
+Build the Go Automatic Instrumentation binary by running:
 `make build`
 
 Alternatively, you can create a Linux Docker container:
 `make docker-build`.
+
+#### Generate compile-commands.json
+
+To help with IDE integration (i.e. `clangd`), a [`compile-commands.json`] file can be generated:
+
+```terminal
+make compile_commands.json
+```
+
+This will use the [bear] utility to generate a [`compile_commands.json`] file.
+
+[bear]: https://github.com/rizsotto/Bear
+[`compile-commands.json`]: https://clang.llvm.org/docs/JSONCompilationDatabase.html
 
 ### Issues
 
 Questions, bug reports, and feature requests can all be submitted as [issues](https://github.com/open-telemetry/opentelemetry-go-instrumentation/issues/new) to this repository.
 
 ## Pull Requests
+
+> [!NOTE]
+> We are currently **not** accepting PRs to add new instrumentation probes. A
+> new [instrumentation probe API] is being designed. To avoid excessive churn
+> and development burden, we will not be accepting new instrumentation probes
+> until that API is completed.
+>
+> Please **do** [open an issue] to track your request for new instrumentation.
+> We would like to know what we are missing and how you plan to use it.
+
+[open an issue]: https://github.com/open-telemetry/opentelemetry-go-instrumentation/issues/new?template=new_instrumentation.yaml
+[instrumentation probe API]: https://github.com/open-telemetry/opentelemetry-go-instrumentation/issues/1105
 
 ### How to Send Pull Requests
 
@@ -104,7 +170,7 @@ request ID to the entry you added to `CHANGELOG.md`.
 
 A PR is considered **ready to merge** when:
 
-* It has received at least one qualified approval[^1].
+* It has received at least one qualified approval[^2].
 
   For complex or sensitive PRs maintainers may require more than one qualified
   approval.
@@ -137,28 +203,34 @@ A PR is considered **ready to merge** when:
 
 Any [Maintainer] can merge the PR once the above criteria have been met.
 
-[^1]: A qualified approval is a GitHub Pull Request review with "Approve"
+[^2]: A qualified approval is a GitHub Pull Request review with "Approve"
   status from an OpenTelemetry Go [Approver] or [Maintainer].
 
 ## Appovers and Maintainers
 
-### Approvers
-
-- [Aaron Clawson](https://github.com/MadVikingGod), LightStep
-- [Dinesh Gurumurthy](https://github.com/dineshg13), DataDog
-- [Robert Pająk](https://github.com/pellared), Splunk
-
 ### Maintainers
 
 - [Eden Federman](https://github.com/edeNFed), Odigos
-- [Mike Dame](https://github.com/damemi), Google
-- [Przemyslaw Delewski](https://github.com/pdelewski), SumoLogic
+- [Mike Dame](https://github.com/damemi), Odigos
 - [Ron Federman](https://github.com/RonFed), Odigos
 - [Tyler Yahn](https://github.com/MrAlias), Splunk
 
+For more information about the maintainer role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#maintainer).
+
+### Approvers
+
+- [Nikola Grcevski](https://github.com/grcevski), Grafana Labs
+- [Robert Pająk](https://github.com/pellared), Splunk
+
+For more information about the approver role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#approver).
+
 ### Emeritus
 
-- [Mike Goldsmith](https://github.com/MikeGoldsmith), Honeycomb
+- [Dinesh Gurumurthy](https://github.com/dineshg13)
+- [Mike Goldsmith](https://github.com/MikeGoldsmith)
+- [Przemyslaw Delewski](https://github.com/pdelewski)
+
+For more information about the emeritus role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#emeritus-maintainerapprovertriager).
 
 ### Become an Approver or a Maintainer
 

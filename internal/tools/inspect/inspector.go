@@ -6,10 +6,10 @@ package inspect
 import (
 	"context"
 	"errors"
+	"log/slog"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/docker/docker/client"
-	"github.com/go-logr/logr"
-	"github.com/hashicorp/go-version"
 	"golang.org/x/sync/errgroup"
 
 	"go.opentelemetry.io/auto/internal/pkg/structfield"
@@ -22,7 +22,7 @@ type Inspector struct {
 	NWorkers int
 	Cache    *Cache
 
-	log    logr.Logger
+	log    *slog.Logger
 	client *client.Client
 
 	jobs []job
@@ -34,12 +34,10 @@ type Inspector struct {
 // If cache is non-nil, offsets will first be looked up there. Otherwise, the
 // offsets will be found by building the applicatiions in the manifests and
 // inspecting the produced binaries.
-func New(l logr.Logger, cache *Cache, manifests ...Manifest) (*Inspector, error) {
-	logger := l.WithName("inspector")
-
+func New(logger *slog.Logger, cache *Cache, manifests ...Manifest) (*Inspector, error) {
 	if cache == nil {
 		logger.Info("using empty cache")
-		cache = newCache(l)
+		cache = newCache(logger)
 	}
 
 	cli, err := client.NewClientWithOpts(
@@ -72,7 +70,7 @@ func (i *Inspector) AddManifest(manifest Manifest) error {
 		return err
 	}
 
-	i.log.V(2).Info("adding manifest", "manifest", manifest)
+	i.log.Debug("adding manifest", "manifest", manifest)
 
 	goVer := manifest.Application.GoVerions
 	if goVer == nil {
@@ -122,7 +120,7 @@ func (i *Inspector) AddManifest(manifest Manifest) error {
 type job struct {
 	Renderer Renderer
 	Builder  *builder
-	AppVer   *version.Version
+	AppVer   *semver.Version
 	Fields   []structfield.ID
 }
 
@@ -181,16 +179,9 @@ func (i *Inspector) Do(ctx context.Context) (*structfield.Index, error) {
 	return index, nil
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 type result struct {
 	StructField structfield.ID
-	Version     *version.Version
+	Version     *semver.Version
 	Offset      uint64
 	// Valid is true if the offset is valid for the struct field at the specified version.
 	Valid bool
@@ -218,7 +209,7 @@ func (i *Inspector) do(ctx context.Context, j job) (out []result, err error) {
 	app, err := newApp(ctx, i.log, j)
 	buildErr := &errBuild{}
 	if errors.As(err, &buildErr) {
-		i.log.V(1).Info(
+		i.log.Debug(
 			"failed to build app, skipping",
 			"version", j.AppVer,
 			"src", j.Renderer.src,

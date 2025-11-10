@@ -1,16 +1,19 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+// Package httpPlusdb provides an example of how to OpenTelemetry
+// auto-instrumentation for Go to instrument an application that runs an HTTP
+// server and interacts with a database.
 package main
 
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 
 	_ "github.com/mattn/go-sqlite3"
-	"go.uber.org/zap"
 )
 
 const (
@@ -24,9 +27,9 @@ const (
 	email TEXT NOT NULL,
 	phone TEXT NOT NULL);`
 
-	tableInsertion = `INSERT INTO 'contacts'
-	('first_name', 'last_name', 'email', 'phone') VALUES
-	('Moshe', 'Levi', 'moshe@gmail.com', '052-1234567');`
+	tableInsertion = "INSERT INTO `contacts` " +
+		"(`first_name`, `last_name`, `email`, `phone`) VALUES " +
+		"('Moshe', 'Levi', 'moshe@gmail.com', '052-1234567');"
 )
 
 // Server is Http server that exposes multiple endpoints.
@@ -34,7 +37,7 @@ type Server struct {
 	db *sql.DB
 }
 
-// Create the db file.
+// CreateDb creates the db file.
 func CreateDb() {
 	file, err := os.Create(dbName)
 	if err != nil {
@@ -84,7 +87,7 @@ func (s *Server) queryDb(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 
-	logger.Info("queryDb called")
+	slog.Info("queryDb called")
 	for rows.Next() {
 		var id int
 		var firstName string
@@ -95,11 +98,17 @@ func (s *Server) queryDb(w http.ResponseWriter, req *http.Request) {
 		if err != nil {
 			panic(err)
 		}
-		fmt.Fprintf(w, "ID: %d, firstName: %s, lastName: %s, email: %s, phone: %s\n", id, firstName, lastName, email, phone)
+		fmt.Fprintf(
+			w,
+			"ID: %d, firstName: %s, lastName: %s, email: %s, phone: %s\n",
+			id,
+			firstName,
+			lastName,
+			email,
+			phone,
+		)
 	}
 }
-
-var logger *zap.Logger
 
 func setupHandler(s *Server) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -108,18 +117,12 @@ func setupHandler(s *Server) *http.ServeMux {
 }
 
 func main() {
-	var err error
-	logger, err = zap.NewDevelopment()
-	if err != nil {
-		fmt.Printf("error creating zap logger, error:%v", err)
-		return
-	}
 	port := fmt.Sprintf(":%d", 8080)
-	logger.Info("starting http server", zap.String("port", port))
+	slog.Info("starting http server", "port", port)
 
 	s := NewServer()
 	mux := setupHandler(s)
-	if err := http.ListenAndServe(port, mux); err != nil {
-		logger.Error("error running server", zap.Error(err))
+	if err := http.ListenAndServe(port, mux); err != nil { //nolint:gosec // Non-timeout HTTP server.
+		slog.Error("error running server", "error", err)
 	}
 }

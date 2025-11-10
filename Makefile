@@ -2,24 +2,34 @@
 # Assume the Makefile is in the root of the repository.
 REPODIR := $(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
+# Used by bpf2go to generate make compatible depinfo files.
+export BPF2GO_MAKEBASE := $(REPODIR)
+
 TOOLS_MOD_DIR := ./internal/tools
 TOOLS = $(CURDIR)/.tools
 
 ALL_GO_MOD_DIRS := $(shell find . -type f -name 'go.mod' ! -path './LICENSES/*' -exec dirname {} \; | sort)
+ALL_GO_MODS := $(shell find . -type f -name 'go.mod' ! -path '$(TOOLS_MOD_DIR)/*' ! -path './LICENSES/*' | sort)
 
-# Build the list of include directories to compile the bpf program
-BPF_INCLUDE += -I${REPODIR}/internal/include/libbpf
-BPF_INCLUDE += -I${REPODIR}/internal/include
+EXAMPLE_MODS := $(filter ./examples/%,$(ALL_GO_MODS))
+
+# BPF compile time dependencies.
+BPF2GO_CFLAGS += -I${REPODIR}/internal/include/libbpf
+BPF2GO_CFLAGS += -I${REPODIR}/internal/include
+export BPF2GO_CFLAGS
 
 # Go default variables
 GOCMD?= go
-GOOS=linux
-CGO_ENABLED=0
+CGO_ENABLED?=0
+
+# User to run as in docker images.
+DOCKER_USER=$(shell id -u):$(shell id -g)
+DEPENDENCIES_DOCKERFILE=./dependencies.Dockerfile
 
 .DEFAULT_GOAL := precommit
 
 .PHONY: precommit
-precommit: license-header-check dependabot-generate go-mod-tidy golangci-lint-fix codespell
+precommit: license-header-check golangci-lint-fix test codespell markdown-lint
 
 # Tools
 $(TOOLS):
@@ -41,51 +51,121 @@ IMG_NAME ?= otel-go-instrumentation
 IMG_NAME_BASE = $(IMG_NAME)-base
 
 GOLANGCI_LINT = $(TOOLS)/golangci-lint
-$(TOOLS)/golangci-lint: PACKAGE=github.com/golangci/golangci-lint/cmd/golangci-lint
+$(TOOLS)/golangci-lint: PACKAGE=github.com/golangci/golangci-lint/v2/cmd/golangci-lint
 
 OFFSETGEN = $(TOOLS)/offsetgen
 $(TOOLS)/offsetgen: PACKAGE=go.opentelemetry.io/auto/$(TOOLS_MOD_DIR)/inspect/cmd/offsetgen
 
+SYNCLIBBPF = $(TOOLS)/synclibbpf
+$(TOOLS)/synclibbpf: PACKAGE=go.opentelemetry.io/auto/$(TOOLS_MOD_DIR)/synclibbpf
+
+CROSSLINK = $(TOOLS)/crosslink
+$(TOOLS)/crosslink: PACKAGE=go.opentelemetry.io/build-tools/crosslink
+
+BEAR := $(TOOLS)/bear
+$(BEAR): $(TOOLS)
+	@if command -v bear >/dev/null 2>&1; then \
+		echo "Found system-wide Bear, linking to $(BEAR)"; \
+		ln -sf $$(command -v bear) $(BEAR); \
+	elif command -v apt-get >/dev/null 2>&1; then \
+		echo "Installing Bear using apt-get..."; \
+		sudo apt-get update && sudo apt-get install -y bear && \
+		ln -sf $$(command -v bear) $(BEAR); \
+	elif command -v pacman >/dev/null 2>&1; then \
+		echo "Installing Bear using pacman..."; \
+		sudo pacman -Sy --noconfirm bear && \
+		ln -sf $$(command -v bear) $(BEAR); \
+	elif command -v brew >/dev/null 2>&1; then \
+		echo "Installing Bear using Homebrew..."; \
+		brew install bear && \
+		ln -sf $$(command -v bear) $(BEAR); \
+	else \
+		echo "No supported package manager found. Installing Bear from source..."; \
+		git clone --depth 1 https://github.com/rizsotto/Bear.git /tmp/Bear && \
+		cd /tmp/Bear && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && \
+		cmake --build build --config Release && \
+		cmake --install build --prefix "$$(pwd)/install" && \
+		cp /tmp/Bear/install/bin/bear $(BEAR) && \
+		rm -rf /tmp/Bear; \
+	fi
+
 .PHONY: tools
-tools: $(GOLICENSES) $(MULTIMOD) $(GOLANGCI_LINT) $(DBOTCONF) $(OFFSETGEN)
+tools: $(GOLICENSES) $(MULTIMOD) $(GOLANGCI_LINT) $(DBOTCONF) $(OFFSETGEN) $(SYNCLIBBPF) $(CROSSLINK) $(BEAR)
 
-ALL_GO_MODS := $(shell find . -type f -name 'go.mod' ! -path '$(TOOLS_MOD_DIR)/*' ! -path './LICENSES/*' | sort)
-GO_MODS_TO_TEST := $(ALL_GO_MODS:%=test/%)
+TEST_TARGETS := test-verbose test-ebpf test-race
+.PHONY: $(TEST_TARGETS) test
+test-ebpf: ARGS = -tags=ebpf_test -run ^TestEBPF # These need to be run with sudo.
+test-verbose: ARGS = -v
+test-race: ARGS = -race
+$(TEST_TARGETS): test
+test: go-mod-tidy generate $(ALL_GO_MODS:%=test/%)
+test/%/go.mod:
+	@cd $* && $(GOCMD) test $(ARGS) ./...
 
-.PHONY: test
-test: generate $(GO_MODS_TO_TEST)
-test/%: GO_MOD=$*
-test/%:
-	cd $(shell dirname $(GO_MOD)) && $(GOCMD) test -v ./...
+PROBE_ROOT = internal/pkg/instrumentation/bpf/
+PROBE_GEN_GO := $(shell find $(PROBE_ROOT) -type f -name 'bpf_*_bpfe[lb].go')
+PROBE_GEN_OBJ := $(PROBE_GEN_GO:.go=.o)
+PROBE_GEN_ALL := $(PROBE_GEN_GO) $(PROBE_GEN_OBJ)
 
-.PHONY: generate
-generate: export CFLAGS := $(BPF_INCLUDE)
-generate: go-mod-tidy
-generate:
+# Include all depinfo files to ensure we only re-generate when needed.
+-include $(shell find $(PROBE_ROOT) -type f -name 'bpf_*_bpfel.go.d')
+
+.PHONY: generate generate/all
+generate: $(PROBE_GEN_ALL)
+
+$(PROBE_GEN_ALL):
+	$(GOCMD) generate ./$(dir $@)...
+
+generate/all:
 	$(GOCMD) generate ./...
+
+.PHONY: clean
+clean:
+	@rm -f $(PROBE_GEN_OBJ)
+	@find $(PROBE_ROOT) -type f -name "*.d" -delete
+
+compile_commands.json: $(BEAR) clean
+	@$(BEAR) --force-wrapper -- $(GOCMD) generate ./...
 
 .PHONY: docker-generate
 docker-generate: docker-build-base
-	docker run --rm -v $(shell pwd):/app $(IMG_NAME_BASE) /bin/sh -c "cd ../app && make generate"
+	docker run --rm -v $(shell pwd):/app $(IMG_NAME_BASE) /bin/sh -c "cd /app && make generate"
 
 .PHONY: docker-test
 docker-test: docker-build-base
-	docker run --rm -v $(shell pwd):/app $(IMG_NAME_BASE) /bin/sh -c "cd ../app && make test"
+	@docker run \
+		--rm \
+		--privileged \
+		--network=host \
+		--user=root \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v "$(REPODIR)":/usr/src/go.opentelemetry.io/auto \
+		-w /usr/src/go.opentelemetry.io/auto \
+		$(IMG_NAME_BASE) \
+		/bin/sh -c "make test"
 
 .PHONY: docker-precommit
 docker-precommit: docker-build-base
-	docker run --rm -v $(shell pwd):/app $(IMG_NAME_BASE) /bin/sh -c "cd ../app && make precommit"
+	docker run --rm -v $(shell pwd):/app $(IMG_NAME_BASE) /bin/sh -c "cd /app && make precommit"
+
+null  :=
+space := $(null) #
+comma := ,
+
+.PHONY: crosslink
+crosslink: $(CROSSLINK)
+	@$(CROSSLINK) --root=$(REPODIR) --skip=$(subst $(space),$(comma),$(strip $(EXAMPLE_MODS:./%=%))) --prune
 
 .PHONY: go-mod-tidy
 go-mod-tidy: $(ALL_GO_MOD_DIRS:%=go-mod-tidy/%)
 go-mod-tidy/%: DIR=$*
-go-mod-tidy/%:
+go-mod-tidy/%: crosslink
 	@cd $(DIR) && $(GOCMD) mod tidy -compat=1.20
 
 .PHONY: golangci-lint golangci-lint-fix
 golangci-lint-fix: ARGS=--fix
 golangci-lint-fix: golangci-lint
-golangci-lint: generate $(ALL_GO_MOD_DIRS:%=golangci-lint/%)
+golangci-lint: go-mod-tidy generate $(ALL_GO_MOD_DIRS:%=golangci-lint/%)
 golangci-lint/%: DIR=$*
 golangci-lint/%: | $(GOLANGCI_LINT)
 	@echo 'golangci-lint $(if $(ARGS),$(ARGS) ,)$(DIR)' \
@@ -93,8 +173,8 @@ golangci-lint/%: | $(GOLANGCI_LINT)
 		&& $(GOLANGCI_LINT) run --allow-serial-runners --timeout=2m0s $(ARGS)
 
 .PHONY: build
-build: generate
-	$(GOCMD) build -o otel-go-instrumentation cli/main.go
+build: go-mod-tidy generate
+	CGO_ENABLED=$(CGO_ENABLED) $(GOCMD) build -o otel-go-instrumentation ./cli/...
 
 .PHONY: docker-build
 docker-build:
@@ -104,14 +184,33 @@ docker-build:
 docker-build-base:
 	docker buildx build -t $(IMG_NAME_BASE) --target base .
 
+docker-dev: docker-build-base
+	@docker run \
+		-it \
+		--rm \
+		--privileged \
+		--network=host \
+		--user=root \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v "$(REPODIR)":/usr/src/go.opentelemetry.io/auto \
+		-w /usr/src/go.opentelemetry.io/auto \
+		$(IMG_NAME_BASE) \
+		/bin/bash
+
+LIBBPF_VERSION ?= "< 1.5, >= 1.4.7"
+LIBBPF_DEST ?= "$(REPODIR)/internal/include/libbpf"
+.PHONY: synclibbpf
+synclibbpf: | $(SYNCLIBBPF)
+	$(SYNCLIBBPF) -version=$(LIBBPF_VERSION) -dest=$(LIBBPF_DEST)
+
 OFFSETS_OUTPUT_FILE="$(REPODIR)/internal/pkg/inject/offset_results.json"
 .PHONY: offsets
 offsets: | $(OFFSETGEN)
 	$(OFFSETGEN) -output=$(OFFSETS_OUTPUT_FILE) -cache=$(OFFSETS_OUTPUT_FILE)
 
 .PHONY: docker-offsets
-docker-offsets:
-	docker run --rm -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock -v $(shell pwd):/app golang:1.22 /bin/sh -c "cd ../app && make offsets"
+docker-offsets: docker-build-base
+	docker run -e DOCKER_USERNAME=$(DOCKER_USERNAME) -e DOCKER_PASSWORD=$(DOCKER_PASSWORD) --rm -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock -v $(shell pwd):/app $(IMG_NAME_BASE) /bin/sh -c "cd ../app && make offsets"
 
 .PHONY: update-licenses
 update-licenses: generate $(GOLICENSES)
@@ -132,15 +231,6 @@ verify-licenses: generate $(GOLICENSES)
       exit 1; \
     fi; \
 
-DEPENDABOT_CONFIG = .github/dependabot.yml
-.PHONY: dependabot-check
-dependabot-check: | $(DBOTCONF)
-	@$(DBOTCONF) --ignore "/LICENSES" verify $(DEPENDABOT_CONFIG) || ( echo "(run: make dependabot-generate)"; exit 1 )
-
-.PHONY: dependabot-generate
-dependabot-generate: | $(DBOTCONF)
-	@$(DBOTCONF) --ignore "/LICENSES" generate > $(DEPENDABOT_CONFIG)
-
 .PHONY: license-header-check
 license-header-check:
 	@licRes=$$(for f in $$(find . -type f \( -iname '*.go' -o -iname '*.sh' -o -iname '*.c' -o -iname '*.h' \) ! -path '**/third_party/*' ! -path './.git/*' ! -path './LICENSES/*' ! -path './internal/include/libbpf/*' ) ; do \
@@ -151,45 +241,6 @@ license-header-check:
 	           echo "license header checking failed:"; echo "$${licRes}"; \
 	           exit 1; \
 	   fi
-
-.PHONY: fixture-nethttp fixture-gin fixture-databasesql fixture-nethttp-custom fixture-otelglobal fixture-kafka-go
-fixture-nethttp-custom: fixtures/nethttp_custom
-fixture-nethttp: fixtures/nethttp
-fixture-gin: fixtures/gin
-fixture-databasesql: fixtures/databasesql
-fixture-grpc: fixtures/grpc
-fixture-otelglobal: fixtures/otelglobal
-fixture-kafka-go: fixtures/kafka-go
-fixtures/%: LIBRARY=$*
-fixtures/%:
-	$(MAKE) docker-build
-	cd internal/test/e2e/$(LIBRARY) && docker build -t sample-app .
-	kind create cluster
-	kind load docker-image otel-go-instrumentation sample-app
-	helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
-	if [ ! -d "opentelemetry-helm-charts" ]; then \
-		git clone https://github.com/open-telemetry/opentelemetry-helm-charts.git; \
-	fi
-	if [ -f ./internal/test/e2e/$(LIBRARY)/collector-helm-values.yml ]; then \
-		helm install test -f ./internal/test/e2e/$(LIBRARY)/collector-helm-values.yml opentelemetry-helm-charts/charts/opentelemetry-collector; \
-	else \
-		helm install test -f .github/workflows/e2e/k8s/collector-helm-values.yml opentelemetry-helm-charts/charts/opentelemetry-collector; \
-	fi
-	while : ; do \
-		kubectl get pod/test-opentelemetry-collector-0 && break; \
-		sleep 5; \
-	done
-	kubectl wait --for=condition=Ready --timeout=60s pod/test-opentelemetry-collector-0
-	kubectl -n default create -f .github/workflows/e2e/k8s/sample-job.yml
-	if kubectl wait --for=condition=Complete --timeout=60s job/sample-job; then \
-		rm -f ./internal/test/e2e/$(LIBRARY)/traces-orig.json; \
-		kubectl cp -c filecp default/test-opentelemetry-collector-0:tmp/trace.json ./internal/test/e2e/$(LIBRARY)/traces-orig.json; \
-		rm -f ./internal/test/e2e/$(LIBRARY)/traces.json; \
-		bats ./internal/test/e2e/$(LIBRARY)/verify.bats; \
-	else \
-		kubectl logs -l app=sample -c auto-instrumentation; \
-	fi
-	kind delete cluster
 
 .PHONY: prerelease
 prerelease: | $(MULTIMOD)
@@ -226,20 +277,20 @@ PIP := $(PYTOOLS)/pip
 WORKDIR := /workdir
 
 # The python image to use for the virtual environment.
-PYTHONIMAGE := python:3.11.3-slim-bullseye
+PYTHONIMAGE := $(shell awk '$$4=="python" {print $$2}' $(DEPENDENCIES_DOCKERFILE))
 
 # Run the python image with the current directory mounted.
-DOCKERPY := docker run --rm -v "$(CURDIR):$(WORKDIR)" -w $(WORKDIR) $(PYTHONIMAGE)
+DOCKERPY := docker run --rm -u $(DOCKER_USER) -v "$(CURDIR):$(WORKDIR)" -w $(WORKDIR) $(PYTHONIMAGE)
 
 # Create a virtual environment for Python tools.
 $(PYTOOLS):
 # The `--upgrade` flag is needed to ensure that the virtual environment is
 # created with the latest pip version.
-	@$(DOCKERPY) bash -c "python3 -m venv $(VENVDIR) && $(PIP) install --upgrade pip"
+	@$(DOCKERPY) bash -c "python3 -m venv $(VENVDIR) && $(PIP) install --upgrade --cache-dir=$(WORKDIR)/.cache/pip pip"
 
 # Install python packages into the virtual environment.
 $(PYTOOLS)/%: $(PYTOOLS)
-	@$(DOCKERPY) $(PIP) install -r requirements.txt
+	@$(DOCKERPY) $(PIP) install --cache-dir=$(WORKDIR)/.cache/pip -r requirements.txt
 
 CODESPELL = $(PYTOOLS)/codespell
 $(CODESPELL): PACKAGE=codespell
@@ -247,3 +298,21 @@ $(CODESPELL): PACKAGE=codespell
 .PHONY: codespell
 codespell: $(CODESPELL)
 	@$(DOCKERPY) $(CODESPELL)
+
+MARKDOWNIMAGE := $(shell awk '$$4=="markdown" {print $$2}' $(DEPENDENCIES_DOCKERFILE))
+.PHONY: markdown-lint
+markdown-lint:
+	docker run --rm -u $(DOCKER_USER) -v "$(CURDIR):$(WORKDIR)" $(MARKDOWNIMAGE) -c $(WORKDIR)/.markdownlint.yaml -p $(WORKDIR)/.markdownlintignore $(WORKDIR)/**/*.md
+
+.PHONY: clang-format
+clang-format:
+	find ./internal -type f -name "*.c" | xargs -P 0 -n 1 clang-format -i
+	find ./internal -type f -name "*.h" | xargs -P 0 -n 1 clang-format -i
+
+.PHONY: install-hooks
+install-hooks:
+	@if [ ! -f .git/hooks/pre-commit ]; then \
+		echo "Installing pre-commit hook..."; \
+		cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit; \
+		echo "Pre-commit hook installed."; \
+	fi

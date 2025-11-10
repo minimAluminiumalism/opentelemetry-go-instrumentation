@@ -23,9 +23,10 @@ Currently, OpenTelemetry Go Automatic Instrumentation is tested for the followin
 
 | OS      | Go Version | Architecture |
 | ------- | ---------- | ------------ |
-| Ubuntu  | 1.22       | amd64        |
-| Ubuntu  | 1.21       | amd64        |
-| Ubuntu  | 1.20       | amd64        |
+| Ubuntu  | 1.25       | amd64        |
+| Ubuntu  | 1.24       | amd64        |
+| Ubuntu  | 1.25       | arm64        |
+| Ubuntu  | 1.24       | arm64        |
 
 Automatic instrumentation should work on any Linux kernel above 4.4.
 
@@ -46,6 +47,10 @@ See [Getting started](docs/getting-started.md) for setup, deployment, and config
 You can also try the [Tutorial](docs/tutorial) for a guide on setting up a sample Emojivoto application.
 
 For technical and design info, see [How it works](docs/how-it-works.md).
+
+## Configuration
+
+See the [configuration documentation](docs/configuration.md).
 
 ## Contributing
 

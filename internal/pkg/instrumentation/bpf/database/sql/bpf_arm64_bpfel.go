@@ -8,13 +8,18 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
-type bpfSliceArrayBuff struct{ Buff [1024]uint8 }
+type bpfSliceArrayBuff struct {
+	_    structs.HostLayout
+	Buff [1024]uint8
+}
 
 type bpfSpanContext struct {
+	_          structs.HostLayout
 	TraceID    [16]uint8
 	SpanID     [8]uint8
 	TraceFlags uint8
@@ -22,6 +27,7 @@ type bpfSpanContext struct {
 }
 
 type bpfSqlRequestT struct {
+	_         structs.HostLayout
 	StartTime uint64
 	EndTime   uint64
 	Sc        bpfSpanContext
@@ -64,9 +70,10 @@ func loadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type bpfSpecs struct {
 	bpfProgramSpecs
 	bpfMapSpecs
+	bpfVariableSpecs
 }
 
-// bpfSpecs contains programs before they are loaded into the kernel.
+// bpfProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
@@ -80,12 +87,25 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	AllocMap          *ebpf.MapSpec `ebpf:"alloc_map"`
-	Events            *ebpf.MapSpec `ebpf:"events"`
-	GoContextToSc     *ebpf.MapSpec `ebpf:"go_context_to_sc"`
-	SliceArrayBuffMap *ebpf.MapSpec `ebpf:"slice_array_buff_map"`
-	SqlEvents         *ebpf.MapSpec `ebpf:"sql_events"`
-	TrackedSpansBySc  *ebpf.MapSpec `ebpf:"tracked_spans_by_sc"`
+	AllocMap              *ebpf.MapSpec `ebpf:"alloc_map"`
+	Events                *ebpf.MapSpec `ebpf:"events"`
+	GoContextToSc         *ebpf.MapSpec `ebpf:"go_context_to_sc"`
+	ProbeActiveSamplerMap *ebpf.MapSpec `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap     *ebpf.MapSpec `ebpf:"samplers_config_map"`
+	SliceArrayBuffMap     *ebpf.MapSpec `ebpf:"slice_array_buff_map"`
+	SqlEvents             *ebpf.MapSpec `ebpf:"sql_events"`
+	TrackedSpansBySc      *ebpf.MapSpec `ebpf:"tracked_spans_by_sc"`
+}
+
+// bpfVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type bpfVariableSpecs struct {
+	EndAddr                  *ebpf.VariableSpec `ebpf:"end_addr"`
+	Hex                      *ebpf.VariableSpec `ebpf:"hex"`
+	ShouldIncludeDbStatement *ebpf.VariableSpec `ebpf:"should_include_db_statement"`
+	StartAddr                *ebpf.VariableSpec `ebpf:"start_addr"`
+	TotalCpus                *ebpf.VariableSpec `ebpf:"total_cpus"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -94,6 +114,7 @@ type bpfMapSpecs struct {
 type bpfObjects struct {
 	bpfPrograms
 	bpfMaps
+	bpfVariables
 }
 
 func (o *bpfObjects) Close() error {
@@ -107,12 +128,14 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	AllocMap          *ebpf.Map `ebpf:"alloc_map"`
-	Events            *ebpf.Map `ebpf:"events"`
-	GoContextToSc     *ebpf.Map `ebpf:"go_context_to_sc"`
-	SliceArrayBuffMap *ebpf.Map `ebpf:"slice_array_buff_map"`
-	SqlEvents         *ebpf.Map `ebpf:"sql_events"`
-	TrackedSpansBySc  *ebpf.Map `ebpf:"tracked_spans_by_sc"`
+	AllocMap              *ebpf.Map `ebpf:"alloc_map"`
+	Events                *ebpf.Map `ebpf:"events"`
+	GoContextToSc         *ebpf.Map `ebpf:"go_context_to_sc"`
+	ProbeActiveSamplerMap *ebpf.Map `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap     *ebpf.Map `ebpf:"samplers_config_map"`
+	SliceArrayBuffMap     *ebpf.Map `ebpf:"slice_array_buff_map"`
+	SqlEvents             *ebpf.Map `ebpf:"sql_events"`
+	TrackedSpansBySc      *ebpf.Map `ebpf:"tracked_spans_by_sc"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -120,10 +143,23 @@ func (m *bpfMaps) Close() error {
 		m.AllocMap,
 		m.Events,
 		m.GoContextToSc,
+		m.ProbeActiveSamplerMap,
+		m.SamplersConfigMap,
 		m.SliceArrayBuffMap,
 		m.SqlEvents,
 		m.TrackedSpansBySc,
 	)
+}
+
+// bpfVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfVariables struct {
+	EndAddr                  *ebpf.Variable `ebpf:"end_addr"`
+	Hex                      *ebpf.Variable `ebpf:"hex"`
+	ShouldIncludeDbStatement *ebpf.Variable `ebpf:"should_include_db_statement"`
+	StartAddr                *ebpf.Variable `ebpf:"start_addr"`
+	TotalCpus                *ebpf.Variable `ebpf:"total_cpus"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.

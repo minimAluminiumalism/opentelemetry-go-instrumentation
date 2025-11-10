@@ -5,8 +5,12 @@
 *.so
 *.dylib
 **/*.o
+**/*.go.d
 .tools/
 **/internal/test/e2e/*/main
+
+# Python pip cache.
+.cache/
 
 # Test binary, built with `go test -c`
 *.test
@@ -27,9 +31,11 @@
 # Installed by `make codespell`
 venv/
 
+# Compile commands contain local paths. Do not track these.
+compile_commands.json
+
 otel-go-instrumentation
 launcher/
-opentelemetry-helm-charts/
 
 # don't track temp e2e trace json files
 internal/test/**/traces-orig.json

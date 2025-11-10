@@ -8,11 +8,13 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type bpfKafkaRequestT struct {
+	_             structs.HostLayout
 	StartTime     uint64
 	EndTime       uint64
 	Sc            bpfSpanContext
@@ -24,9 +26,13 @@ type bpfKafkaRequestT struct {
 	Partition     int64
 }
 
-type bpfSliceArrayBuff struct{ Buff [1024]uint8 }
+type bpfSliceArrayBuff struct {
+	_    structs.HostLayout
+	Buff [1024]uint8
+}
 
 type bpfSpanContext struct {
+	_          structs.HostLayout
 	TraceID    [16]uint8
 	SpanID     [8]uint8
 	TraceFlags uint8
@@ -68,9 +74,10 @@ func loadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type bpfSpecs struct {
 	bpfProgramSpecs
 	bpfMapSpecs
+	bpfVariableSpecs
 }
 
-// bpfSpecs contains programs before they are loaded into the kernel.
+// bpfProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
@@ -89,8 +96,27 @@ type bpfMapSpecs struct {
 	KafkaEvents            *ebpf.MapSpec `ebpf:"kafka_events"`
 	KafkaReaderToConn      *ebpf.MapSpec `ebpf:"kafka_reader_to_conn"`
 	KafkaRequestStorageMap *ebpf.MapSpec `ebpf:"kafka_request_storage_map"`
+	ProbeActiveSamplerMap  *ebpf.MapSpec `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap      *ebpf.MapSpec `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap      *ebpf.MapSpec `ebpf:"slice_array_buff_map"`
 	TrackedSpansBySc       *ebpf.MapSpec `ebpf:"tracked_spans_by_sc"`
+}
+
+// bpfVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type bpfVariableSpecs struct {
+	EndAddr                *ebpf.VariableSpec `ebpf:"end_addr"`
+	Hex                    *ebpf.VariableSpec `ebpf:"hex"`
+	MessageHeadersPos      *ebpf.VariableSpec `ebpf:"message_headers_pos"`
+	MessageKeyPos          *ebpf.VariableSpec `ebpf:"message_key_pos"`
+	MessageOffsetPos       *ebpf.VariableSpec `ebpf:"message_offset_pos"`
+	MessagePartitionPos    *ebpf.VariableSpec `ebpf:"message_partition_pos"`
+	MessageTopicPos        *ebpf.VariableSpec `ebpf:"message_topic_pos"`
+	ReaderConfigGroupIdPos *ebpf.VariableSpec `ebpf:"reader_config_group_id_pos"`
+	ReaderConfigPos        *ebpf.VariableSpec `ebpf:"reader_config_pos"`
+	StartAddr              *ebpf.VariableSpec `ebpf:"start_addr"`
+	TotalCpus              *ebpf.VariableSpec `ebpf:"total_cpus"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -99,6 +125,7 @@ type bpfMapSpecs struct {
 type bpfObjects struct {
 	bpfPrograms
 	bpfMaps
+	bpfVariables
 }
 
 func (o *bpfObjects) Close() error {
@@ -119,6 +146,8 @@ type bpfMaps struct {
 	KafkaEvents            *ebpf.Map `ebpf:"kafka_events"`
 	KafkaReaderToConn      *ebpf.Map `ebpf:"kafka_reader_to_conn"`
 	KafkaRequestStorageMap *ebpf.Map `ebpf:"kafka_request_storage_map"`
+	ProbeActiveSamplerMap  *ebpf.Map `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap      *ebpf.Map `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap      *ebpf.Map `ebpf:"slice_array_buff_map"`
 	TrackedSpansBySc       *ebpf.Map `ebpf:"tracked_spans_by_sc"`
 }
@@ -132,9 +161,28 @@ func (m *bpfMaps) Close() error {
 		m.KafkaEvents,
 		m.KafkaReaderToConn,
 		m.KafkaRequestStorageMap,
+		m.ProbeActiveSamplerMap,
+		m.SamplersConfigMap,
 		m.SliceArrayBuffMap,
 		m.TrackedSpansBySc,
 	)
+}
+
+// bpfVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfVariables struct {
+	EndAddr                *ebpf.Variable `ebpf:"end_addr"`
+	Hex                    *ebpf.Variable `ebpf:"hex"`
+	MessageHeadersPos      *ebpf.Variable `ebpf:"message_headers_pos"`
+	MessageKeyPos          *ebpf.Variable `ebpf:"message_key_pos"`
+	MessageOffsetPos       *ebpf.Variable `ebpf:"message_offset_pos"`
+	MessagePartitionPos    *ebpf.Variable `ebpf:"message_partition_pos"`
+	MessageTopicPos        *ebpf.Variable `ebpf:"message_topic_pos"`
+	ReaderConfigGroupIdPos *ebpf.Variable `ebpf:"reader_config_group_id_pos"`
+	ReaderConfigPos        *ebpf.Variable `ebpf:"reader_config_pos"`
+	StartAddr              *ebpf.Variable `ebpf:"start_addr"`
+	TotalCpus              *ebpf.Variable `ebpf:"total_cpus"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.

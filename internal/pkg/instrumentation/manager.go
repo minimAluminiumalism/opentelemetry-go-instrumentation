@@ -1,33 +1,26 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+// Package instrumentation provides functionality to manage instrumentation
+// using eBPF for Go programs.
 package instrumentation
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
-	"github.com/go-logr/logr"
 
 	"go.opentelemetry.io/otel/trace"
 
-	"go.opentelemetry.io/auto/config"
-	dbSql "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/database/sql"
-	kafkaConsumer "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/github.com/segmentio/kafka-go/consumer"
-	kafkaProducer "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/github.com/segmentio/kafka-go/producer"
-	otelTraceGlobal "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/go.opentelemetry.io/otel/traceglobal"
-	grpcClient "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/google.golang.org/grpc/client"
-	grpcServer "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/google.golang.org/grpc/server"
-	httpClient "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/net/http/client"
-	httpServer "go.opentelemetry.io/auto/internal/pkg/instrumentation/bpf/net/http/server"
 	"go.opentelemetry.io/auto/internal/pkg/instrumentation/bpffs"
 	"go.opentelemetry.io/auto/internal/pkg/instrumentation/probe"
-	"go.opentelemetry.io/auto/internal/pkg/opentelemetry"
 	"go.opentelemetry.io/auto/internal/pkg/process"
+	"go.opentelemetry.io/auto/pipeline"
 )
 
 // Function variables overridden in testing.
@@ -41,59 +34,83 @@ var (
 type managerState int
 
 const (
-	managerStateRunning managerState = iota
+	managerStateUninitialized managerState = iota
+	managerStateLoaded
+	managerStateRunning
 	managerStateStopped
 )
 
 // Manager handles the management of [probe.Probe] instances.
 type Manager struct {
-	logger          logr.Logger
+	logger          *slog.Logger
 	probes          map[probe.ID]probe.Probe
-	otelController  *opentelemetry.Controller
-	globalImpl      bool
-	loadedIndicator chan struct{}
-	cp              config.Provider
+	handler         *pipeline.Handler
+	cp              ConfigProvider
 	exe             *link.Executable
-	td              *process.TargetDetails
+	proc            *process.Info
+	stop            context.CancelCauseFunc
 	runningProbesWG sync.WaitGroup
-	eventCh         chan *probe.Event
-	currentConfig   config.InstrumentationConfig
+	currentConfig   Config
 	probeMu         sync.Mutex
 	state           managerState
+	stateMu         sync.RWMutex
 }
 
 // NewManager returns a new [Manager].
-func NewManager(logger logr.Logger, otelController *opentelemetry.Controller, globalImpl bool, loadIndicator chan struct{}, cp config.Provider) (*Manager, error) {
-	logger = logger.WithName("Manager")
+func NewManager(
+	logger *slog.Logger,
+	h *pipeline.Handler,
+	pid process.ID,
+	cp ConfigProvider,
+	probes ...probe.Probe,
+) (*Manager, error) {
 	m := &Manager{
-		logger:          logger,
-		probes:          make(map[probe.ID]probe.Probe),
-		otelController:  otelController,
-		globalImpl:      globalImpl,
-		loadedIndicator: loadIndicator,
-		cp:              cp,
-		eventCh:         make(chan *probe.Event),
+		logger:  logger,
+		probes:  make(map[probe.ID]probe.Probe),
+		handler: h,
+		cp:      cp,
 	}
 
-	err := m.registerProbes()
+	funcs := make(map[string]any)
+	for _, p := range probes {
+		if err := m.registerProbe(p); err != nil {
+			return nil, err
+		}
+
+		for _, s := range p.Manifest().Symbols {
+			funcs[s.Symbol] = nil
+		}
+	}
+
+	var err error
+	m.proc, err = process.NewInfo(pid, funcs)
 	if err != nil {
 		return nil, err
 	}
+
+	m.logger.Info("loaded process info", "process", m.proc)
+
+	m.filterUnusedProbes()
 
 	return m, nil
 }
 
 func (m *Manager) validateProbeDependents(id probe.ID, symbols []probe.FunctionSymbol) error {
 	// Validate that dependent probes point to real standalone probes.
-	funcsMap := make(map[string]interface{})
+	funcsMap := make(map[string]struct{}, len(symbols))
 	for _, s := range symbols {
-		funcsMap[s.Symbol] = nil
+		funcsMap[s.Symbol] = struct{}{}
 	}
 
 	for _, s := range symbols {
 		for _, d := range s.DependsOn {
 			if _, exists := funcsMap[d]; !exists {
-				return fmt.Errorf("library %s has declared a dependent function %s for probe %s which does not exist, aborting", id, d, s.Symbol)
+				return fmt.Errorf(
+					"library %s has declared a dependent function %s for probe %s which does not exist, aborting",
+					id,
+					d,
+					s.Symbol,
+				)
 			}
 		}
 	}
@@ -102,7 +119,7 @@ func (m *Manager) validateProbeDependents(id probe.ID, symbols []probe.FunctionS
 }
 
 func (m *Manager) registerProbe(p probe.Probe) error {
-	id := p.Manifest().Id
+	id := p.Manifest().ID
 	if _, exists := m.probes[id]; exists {
 		return fmt.Errorf("library %s registered twice, aborting", id)
 	}
@@ -115,24 +132,12 @@ func (m *Manager) registerProbe(p probe.Probe) error {
 	return nil
 }
 
-// GetRelevantFuncs returns the instrumented functions for all managed probes.
-func (m *Manager) GetRelevantFuncs() map[string]interface{} {
-	funcsMap := make(map[string]interface{})
-	for _, i := range m.probes {
-		for _, s := range i.Manifest().Symbols {
-			funcsMap[s.Symbol] = nil
-		}
-	}
-
-	return funcsMap
-}
-
-// FilterUnusedProbes filterers probes whose functions are already instrumented
+// filterUnusedProbes filterers probes whose functions are already instrumented
 // out of the Manager.
-func (m *Manager) FilterUnusedProbes(target *process.TargetDetails) {
-	existingFuncMap := make(map[string]interface{})
-	for _, f := range target.Functions {
-		existingFuncMap[f.Name] = nil
+func (m *Manager) filterUnusedProbes() {
+	existingFuncMap := make(map[string]struct{}, len(m.proc.Functions))
+	for _, f := range m.proc.Functions {
+		existingFuncMap[f.Name] = struct{}{}
 	}
 
 	for name, inst := range m.probes {
@@ -147,14 +152,14 @@ func (m *Manager) FilterUnusedProbes(target *process.TargetDetails) {
 		}
 
 		if !funcsFound {
-			m.logger.V(1).Info("no functions found for probe, removing", "name", name)
+			m.logger.Debug("no functions found for probe, removing", "name", name)
 			delete(m.probes, name)
 		}
 	}
 }
 
-func getProbeConfig(id probe.ID, c config.InstrumentationConfig) (config.InstrumentationLibrary, bool) {
-	libKindID := config.InstrumentationLibraryID{
+func getProbeConfig(id probe.ID, c Config) (Library, bool) {
+	libKindID := LibraryID{
 		InstrumentedPkg: id.InstrumentedPkg,
 		SpanKind:        id.SpanKind,
 	}
@@ -163,7 +168,7 @@ func getProbeConfig(id probe.ID, c config.InstrumentationConfig) (config.Instrum
 		return lib, true
 	}
 
-	libID := config.InstrumentationLibraryID{
+	libID := LibraryID{
 		InstrumentedPkg: id.InstrumentedPkg,
 		SpanKind:        trace.SpanKindUnspecified,
 	}
@@ -172,18 +177,18 @@ func getProbeConfig(id probe.ID, c config.InstrumentationConfig) (config.Instrum
 		return lib, true
 	}
 
-	return config.InstrumentationLibrary{}, false
+	return Library{}, false
 }
 
-func isProbeEnabled(id probe.ID, c config.InstrumentationConfig) bool {
+func isProbeEnabled(id probe.ID, c Config) bool {
 	if pc, ok := getProbeConfig(id, c); ok && pc.TracesEnabled != nil {
 		return *pc.TracesEnabled
 	}
 	return !c.DefaultTracesDisabled
 }
 
-func (m *Manager) applyConfig(c config.InstrumentationConfig) error {
-	if m.td == nil {
+func (m *Manager) applyConfig(c Config) error {
+	if m.proc == nil {
 		return errors.New("failed to apply config: target details not set")
 	}
 	if m.exe == nil {
@@ -210,7 +215,7 @@ func (m *Manager) applyConfig(c config.InstrumentationConfig) error {
 
 		if !currentlyEnabled && newEnabled {
 			m.logger.Info("Enabling probe", "id", id)
-			err = errors.Join(err, p.Load(m.exe, m.td, c.Sampler))
+			err = errors.Join(err, p.Load(m.exe, m.proc, c.SamplingConfig))
 			if err == nil {
 				m.runProbe(p)
 			}
@@ -225,7 +230,7 @@ func (m *Manager) runProbe(p probe.Probe) {
 	m.runningProbesWG.Add(1)
 	go func(ap probe.Probe) {
 		defer m.runningProbesWG.Done()
-		ap.Run(m.eventCh)
+		ap.Run(m.handler)
 	}(p)
 }
 
@@ -236,12 +241,14 @@ func (m *Manager) ConfigLoop(ctx context.Context) {
 			return
 		case c, ok := <-m.cp.Watch():
 			if !ok {
-				m.logger.Info("Configuration provider closed, configuration updates will no longer be received")
+				m.logger.Info(
+					"Configuration provider closed, configuration updates will no longer be received",
+				)
 				return
 			}
 			err := m.applyConfig(c)
 			if err != nil {
-				m.logger.Error(err, "Failed to apply config")
+				m.logger.Error("Failed to apply config", "error", err)
 				continue
 			}
 			m.currentConfig = c
@@ -249,20 +256,42 @@ func (m *Manager) ConfigLoop(ctx context.Context) {
 	}
 }
 
-// Run runs the event processing loop for all managed probes.
-func (m *Manager) Run(ctx context.Context, target *process.TargetDetails) error {
+func (m *Manager) Load(ctx context.Context) error {
 	if len(m.probes) == 0 {
 		return errors.New("no instrumentation for target process")
 	}
 	if m.cp == nil {
 		return errors.New("no config provider set")
 	}
+	if m.proc == nil {
+		return errors.New(
+			"target details not set - load is called on non-initialized instrumentation",
+		)
+	}
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	if m.state == managerStateRunning {
+		return errors.New("manager is already running, load is not allowed")
+	}
 
 	m.currentConfig = m.cp.InitialConfig(ctx)
-
-	err := m.load(target)
+	err := m.loadProbes()
 	if err != nil {
 		return err
+	}
+
+	m.state = managerStateLoaded
+
+	return nil
+}
+
+func (m *Manager) runProbes(ctx context.Context) (context.Context, error) {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	if m.state != managerStateLoaded {
+		return nil, errors.New("manager is not loaded, call Load before Run")
 	}
 
 	for id, p := range m.probes {
@@ -271,124 +300,110 @@ func (m *Manager) Run(ctx context.Context, target *process.TargetDetails) error 
 		}
 	}
 
-	if m.loadedIndicator != nil {
-		close(m.loadedIndicator)
-	}
+	ctx, stop := context.WithCancelCause(ctx)
+	m.stop = stop
 	m.state = managerStateRunning
+	return ctx, nil
+}
+
+// Run runs the event processing loop for all managed probes.
+func (m *Manager) Run(ctx context.Context) error {
+	ctx, err := m.runProbes(ctx)
+	if err != nil {
+		return err
+	}
 
 	go m.ConfigLoop(ctx)
 
-	for {
-		select {
-		case <-ctx.Done():
-			m.probeMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		defer close(done)
+		<-ctx.Done()
 
-			m.logger.V(1).Info("Shutting down all probes")
-			err := m.cleanup(target)
-
-			// Wait for all probes to stop before closing the chan they send on.
-			m.runningProbesWG.Wait()
-			close(m.eventCh)
-
-			m.state = managerStateStopped
-			m.probeMu.Unlock()
-			return errors.Join(err, ctx.Err())
-		case e := <-m.eventCh:
-			m.otelController.Trace(e)
+		err := m.Stop()
+		if e := context.Cause(ctx); !errors.Is(e, errStop) {
+			err = errors.Join(err, e)
 		}
-	}
+		done <- err
+	}()
+
+	return <-done
 }
 
-func (m *Manager) load(target *process.TargetDetails) error {
+var errStop = errors.New("stopped called")
+
+// Stop stops all probes and cleans up all the resources associated with them.
+func (m *Manager) Stop() error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+
+	currentState := m.state
+	if currentState == managerStateUninitialized || currentState == managerStateStopped {
+		return nil
+	}
+
+	if currentState == managerStateRunning {
+		m.stop(errStop)
+	}
+
+	m.probeMu.Lock()
+	defer m.probeMu.Unlock()
+
+	m.logger.Debug("Shutting down all probes")
+	err := m.cleanup()
+
+	// Wait for all probes to stop.
+	m.runningProbesWG.Wait()
+
+	m.state = managerStateStopped
+	return err
+}
+
+func (m *Manager) loadProbes() error {
 	// Remove resource limits for kernels <5.11.
 	if err := rlimitRemoveMemlock(); err != nil {
 		return err
 	}
 
-	exe, err := openExecutable(fmt.Sprintf("/proc/%d/exe", target.PID))
+	exe, err := openExecutable(m.proc.ID.ExePath())
 	if err != nil {
 		return err
 	}
 	m.exe = exe
 
-	if m.td == nil {
-		m.td = target
-	}
-
-	if err := m.mount(target); err != nil {
+	m.logger.Debug("Mounting bpffs")
+	if err := bpffsMount(m.proc); err != nil {
 		return err
 	}
 
 	// Load probes
 	for name, i := range m.probes {
 		if isProbeEnabled(name, m.currentConfig) {
-			m.logger.V(0).Info("loading probe", "name", name)
-			err := i.Load(exe, target, m.currentConfig.Sampler)
+			m.logger.Info("loading probe", "name", name)
+			err := i.Load(exe, m.proc, m.currentConfig.SamplingConfig)
 			if err != nil {
-				m.logger.Error(err, "error while loading probes, cleaning up", "name", name)
-				return errors.Join(err, m.cleanup(target))
+				m.logger.Error(
+					"error while loading probes, cleaning up",
+					"error",
+					err,
+					"name",
+					name,
+				)
+				return errors.Join(err, m.cleanup())
 			}
 		}
 	}
 
-	m.logger.V(1).Info("loaded probes to memory", "total_probes", len(m.probes))
+	m.logger.Debug("loaded probes to memory", "total_probes", len(m.probes))
 	return nil
 }
 
-func (m *Manager) mount(target *process.TargetDetails) error {
-	if target.AllocationDetails != nil {
-		m.logger.V(1).Info("Mounting bpffs", "allocations_details", target.AllocationDetails)
-	} else {
-		m.logger.V(1).Info("Mounting bpffs")
-	}
-	return bpffsMount(target)
-}
-
-func (m *Manager) cleanup(target *process.TargetDetails) error {
-	ctx := context.Background()
+func (m *Manager) cleanup() error {
 	err := m.cp.Shutdown(context.Background())
 	for _, i := range m.probes {
 		err = errors.Join(err, i.Close())
 	}
 
-	// Wait for all probes to close so we know there is no more telemetry being
-	// generated before stopping (and flushing) the Controller.
-	if m.otelController != nil {
-		err = errors.Join(err, m.otelController.Shutdown(ctx))
-	}
-
-	m.logger.V(1).Info("Cleaning bpffs")
-	return errors.Join(err, bpffsCleanup(target))
-}
-
-//nolint:revive // ignoring linter complaint about control flag
-func availableProbes(l logr.Logger, withTraceGlobal bool) []probe.Probe {
-	insts := []probe.Probe{
-		grpcClient.New(l),
-		grpcServer.New(l),
-		httpServer.New(l),
-		httpClient.New(l),
-		dbSql.New(l),
-		kafkaProducer.New(l),
-		kafkaConsumer.New(l),
-	}
-
-	if withTraceGlobal {
-		insts = append(insts, otelTraceGlobal.New(l))
-	}
-
-	return insts
-}
-
-func (m *Manager) registerProbes() error {
-	insts := availableProbes(m.logger, m.globalImpl)
-
-	for _, i := range insts {
-		err := m.registerProbe(i)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	m.logger.Debug("Cleaning bpffs")
+	return errors.Join(err, bpffsCleanup(m.proc))
 }

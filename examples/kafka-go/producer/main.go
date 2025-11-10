@@ -1,6 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+// Package producer exemplifies use of OpenTelemetry auto-instrumentation for
+// Kafka producers using github.com/segmentio/kafka-go.
 package main
 
 import (
@@ -59,7 +61,7 @@ func (s *server) producerHandler(wrt http.ResponseWriter, req *http.Request) {
 
 func getKafkaWriter() *kafka.Writer {
 	return &kafka.Writer{
-		Addr:            kafka.TCP("kafka:9092"),
+		Addr:            kafka.TCP("broker:9092"),
 		Balancer:        &kafka.LeastBytes{},
 		RequiredAcks:    1,
 		Async:           true,
@@ -72,12 +74,12 @@ func main() {
 	kafkaWriter := getKafkaWriter()
 	defer kafkaWriter.Close()
 
-	_, err := kafka.DialLeader(context.Background(), "tcp", "kafka:9092", "topic1", 0)
+	_, err := kafka.DialLeader(context.Background(), "tcp", "broker:9092", "topic1", 0)
 	if err != nil {
 		panic(err.Error())
 	}
 
-	_, err = kafka.DialLeader(context.Background(), "tcp", "kafka:9092", "topic2", 0)
+	_, err = kafka.DialLeader(context.Background(), "tcp", "broker:9092", "topic2", 0)
 	if err != nil {
 		panic(err.Error())
 	}
@@ -91,5 +93,5 @@ func main() {
 
 	// Run the web server.
 	fmt.Println("start producer-api ... !!")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	log.Fatal(http.ListenAndServe(":8080", nil)) //nolint:gosec // Non-timeout HTTP server.
 }

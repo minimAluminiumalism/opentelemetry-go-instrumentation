@@ -2,46 +2,37 @@ name: Checks
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
-env:
-  GO_VERSION: "~1.22.2"
+permissions:
+  contents: read
 
 jobs:
-  check-links:
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    - uses: lycheeverse/lychee-action@v1.10.0
-      with:
-        args: >-
-          -v -n "*.md" "**/*.md"
-          --exclude "http://localhost*"
-        fail: true
   lint:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: stable
           check-latest: true
           cache-dependency-path: "**/go.sum"
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Module cache
-        uses: actions/cache@v4.0.2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         env:
           cache-name: go-mod-cache
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-${{ env.cache-name }}-${{ hashFiles('**/go.sum') }}
       - name: Tools cache
-        uses: actions/cache@v4.0.2
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         env:
           cache-name: go-tools-cache
         with:
@@ -51,25 +42,136 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
       - name: Run linters
-        run: make license-header-check dependabot-check go-mod-tidy golangci-lint
+        run: make license-header-check go-mod-tidy golangci-lint
       - name: Check clean repository
         run: make check-clean-work-tree
+  race-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache-dependency-path: "**/go.sum"
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: Run tests
+        run: make test-race
+  detect-integration-tests:
+    runs-on: ubuntu-latest
+    outputs:
+      tests: ${{ steps.set-tests.outputs.tests }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - id: set-tests
+        run: |
+          tests=$( \
+            find ./internal/test/e2e -depth -maxdepth 1 -mindepth 1 -type d -exec basename {} \; \
+            | jq -R -s -c 'split("\n")[:-1]' \
+          )
+          echo "tests=$tests"
+          echo "tests=$tests" >> $GITHUB_OUTPUT
+  integration-test:
+    needs: detect-integration-tests
+    strategy:
+      matrix:
+        test: ${{ fromJSON(needs.detect-integration-tests.outputs.tests) }}
+        runner: [ubuntu-latest, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: golang:1.25.3-bookworm@sha256:ee420c17fa013f71eca6b35c3547b854c838d4f26056a34eb6171bba5bf8ece4
+      options: --user root --privileged
+    steps:
+      - id: go-cache-paths
+        run: |
+          echo "go-build=$(go env GOCACHE)" >> $GITHUB_OUTPUT
+          echo "go-mod=$(go env GOMODCACHE)" >> $GITHUB_OUTPUT
+      - name: Checkout Repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Go Build Cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.go-cache-paths.outputs.go-build }}
+          key: ${{ runner.os }}-${{ matrix.test}}-go-build-${{ hashFiles('**/go.sum') }}
+      - name: Go Mod Cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.go-cache-paths.outputs.go-mod }}
+          key: ${{ runner.os }}-${{ matrix.test}}-go-mod-${{ hashFiles('**/go.sum') }}
+      - name: Install dependencies
+        run: apt-get update && apt-get install -y sudo clang llvm
+      - name: Initialize
+        run: make go-mod-tidy generate
+      - name: Test ${{ matrix.test }}
+        shell: bash
+        env:
+          TEST: ${{ matrix.test }}
+        run: |
+          # Create a temp file to store the JSON output
+          tmpfile=$(mktemp)
+
+          cd "internal/test/e2e/$TEST"
+
+          # Stream test output to stdout and save to file for jq
+          go test -v -run='^TestIntegration' | tee "$tmpfile"
+
+          # Fail if any "skip" action occurs under TestIntegration/
+          go tool test2json < "$tmpfile" | jq -e '
+            select(
+              .Action == "skip" and
+              .Test == "TestIntegration"
+            )' >/dev/null && {
+                rm "$tmpfile"
+                echo "❌ TestIntegration was skipped!"
+                exit 1
+            }
+          rm "$tmpfile"
+
+  sdk-compatibility-test:
+    strategy:
+      matrix:
+        go-version: ["stable", "oldstable"]
+        platform:
+          - os: ubuntu-latest
+            arch: "386"
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-22.04-arm
+            arch: arm64
+          - os: macos-13
+            arch: amd64
+          - os: macos-latest
+            arch: arm64
+          - os: windows-latest
+            arch: "386"
+          - os: windows-latest
+            arch: amd64
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
+        with:
+          go-version: ${{ matrix.go-version }}
+          check-latest: true
+          cache-dependency-path: "**/go.sum"
+      - name: Test sdk module
+        env:
+          GOARCH: ${{ matrix.platform.arch }}
+        run: cd sdk && go test -v ./...
   compatibility-test:
     strategy:
       matrix:
-        go-version: ["~1.22.2", "~1.21.9"]
-        os: [ubuntu-latest]
-        # GitHub Actions does not support arm* architectures on default
-        # runners. It is possible to accomplish this with a self-hosted runner
-        # if we want to add this in the future:
-        # https://docs.github.com/en/actions/hosting-your-own-runners/using-self-hosted-runners-in-a-workflow
-        arch: [amd64]
+        go-version: ["stable", "oldstable"]
+        os: [ubuntu-latest, ubuntu-22.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
         with:
           go-version: ${{ matrix.go-version }}
           check-latest: true
@@ -77,20 +179,44 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang llvm
       - name: Run tests
-        env:
-          GOARCH: ${{ matrix.arch }}
         run: make test
+      - name: Run eBPF verification tests
+        run: sudo --preserve-env=PATH make test-ebpf
+      - name: Check repository unmodified
+        run: make check-clean-work-tree
   verify-licenses:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: stable
           check-latest: true
           cache-dependency-path: "**/go.sum"
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
       - run: make verify-licenses
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Build auto-instrumentation
+        run: make docker-build
+  offsets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5
+      - name: Setup Go
+        uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6
+        with:
+          go-version: stable
+          check-latest: true
+          cache-dependency-path: "**/go.sum"
+      - name: Update offsets
+        run: make offsets
+      - name: Check diff
+        run: make check-clean-work-tree

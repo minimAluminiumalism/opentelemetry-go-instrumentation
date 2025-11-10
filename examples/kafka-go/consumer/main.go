@@ -1,6 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+// Package consumer exemplifies use of OpenTelemetry auto-instrumentation for
+// Kafka consumers using github.com/segmentio/kafka-go.
 package main
 
 import (
@@ -21,7 +23,7 @@ var tracer = otel.Tracer("trace-example-kafka-go", trace.WithInstrumentationVers
 
 func getKafkaReader() *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
-		Brokers:          []string{"kafka:9092"},
+		Brokers:          []string{"broker:9092"},
 		GroupID:          "some group id",
 		Topic:            "topic1",
 		ReadBatchTimeout: 1 * time.Millisecond,
@@ -48,9 +50,16 @@ func reader(ctx context.Context) {
 			span.SetAttributes(
 				attribute.String("topic", m.Topic),
 				attribute.Int64("partition", int64(m.Partition)),
-				attribute.Int64("offset", int64(m.Offset)),
+				attribute.Int64("offset", m.Offset),
 			)
-			fmt.Printf("consumed message at topic:%v partition:%v offset:%v	%s = %s\n", m.Topic, m.Partition, m.Offset, string(m.Key), string(m.Value))
+			fmt.Printf(
+				"consumed message at topic:%v partition:%v offset:%v	%s = %s\n",
+				m.Topic,
+				m.Partition,
+				m.Offset,
+				string(m.Key),
+				string(m.Value),
+			)
 			span.End()
 		}
 	}

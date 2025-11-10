@@ -11,16 +11,22 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/auto/internal/pkg/instrumentation/context"
-	"go.opentelemetry.io/auto/internal/pkg/instrumentation/probe"
+	"go.opentelemetry.io/auto/internal/pkg/instrumentation/kernel"
+	"go.opentelemetry.io/auto/internal/pkg/instrumentation/pdataconv"
 )
 
 func TestProbeConvertEvent(t *testing.T) {
-	start := time.Now()
+	start := time.Unix(0, time.Now().UnixNano()) // No wall clock.
 	end := start.Add(1 * time.Second)
+
+	startOffset := kernel.TimeToBootOffset(start)
+	endOffset := kernel.TimeToBootOffset(end)
 
 	traceID := trace.TraceID{1}
 	spanID := trace.SpanID{1}
@@ -28,10 +34,10 @@ func TestProbeConvertEvent(t *testing.T) {
 	var floatBuf [128]byte
 	binary.LittleEndian.PutUint64(floatBuf[:], math.Float64bits(math.Pi))
 
-	got := convertEvent(&event{
+	scope, url, spans := processFn(&event{
 		BaseSpanProperties: context.BaseSpanProperties{
-			StartTime:   uint64(start.UnixNano()),
-			EndTime:     uint64(end.UnixNano()),
+			StartTime:   startOffset,
+			EndTime:     endOffset,
 			SpanContext: context.EBPFSpanContext{TraceID: traceID, SpanID: spanID},
 		},
 		// span name: "Foo"
@@ -55,7 +61,10 @@ func TestProbeConvertEvent(t *testing.T) {
 					// "string_key1"
 					Key: [32]byte{0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x5f, 0x6b, 0x65, 0x79, 0x31},
 					// "string value 1"
-					Value: [128]byte{0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x20, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x20, 0x31},
+					Value: [128]byte{
+						0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x20,
+						0x76, 0x61, 0x6c, 0x75, 0x65, 0x20, 0x31,
+					},
 				},
 				{
 					ValLength: 0,
@@ -82,7 +91,10 @@ func TestProbeConvertEvent(t *testing.T) {
 					// "string_key2"
 					Key: [32]byte{0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x5f, 0x6b, 0x65, 0x79, 0x32},
 					// "string value 2"
-					Value: [128]byte{0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x20, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x20, 0x32},
+					Value: [128]byte{
+						0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x20,
+						0x76, 0x61, 0x6c, 0x75, 0x65, 0x20, 0x32,
+					},
 				},
 			},
 			ValidAttrs: 5,
@@ -97,26 +109,29 @@ func TestProbeConvertEvent(t *testing.T) {
 		},
 	})
 
-	sc := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    traceID,
-		SpanID:     spanID,
-		TraceFlags: trace.FlagsSampled,
-	})
-	want := &probe.SpanEvent{
-		SpanName:    "Foo",
-		StartTime:   int64(start.UnixNano()),
-		EndTime:     int64(end.UnixNano()),
-		SpanContext: &sc,
-		Attributes: []attribute.KeyValue{
-			attribute.Bool("bool_key", true),
-			attribute.String("string_key1", "string value 1"),
-			attribute.Float64("float_key", math.Pi),
-			attribute.Int64("int_key", 42),
-			attribute.String("string_key2", "string value 2"),
-		},
-		TracerName:    "user-tracer",
-		TracerVersion: "v1",
-		TracerSchema:  "user-schema",
-	}
-	assert.Equal(t, want, got[0])
+	wantScope := pcommon.NewInstrumentationScope()
+	wantScope.SetName("user-tracer")
+	wantScope.SetVersion("v1")
+	assert.Equal(t, wantScope, scope)
+
+	assert.Equal(t, "user-schema", url)
+
+	wantSpans := ptrace.NewSpanSlice()
+	span := wantSpans.AppendEmpty()
+	span.SetName("Foo")
+	span.SetKind(ptrace.SpanKindClient)
+	span.SetStartTimestamp(kernel.BootOffsetToTimestamp(startOffset))
+	span.SetEndTimestamp(kernel.BootOffsetToTimestamp(endOffset))
+	span.SetTraceID(pcommon.TraceID(traceID))
+	span.SetSpanID(pcommon.SpanID(spanID))
+	span.SetFlags(uint32(trace.FlagsSampled))
+	pdataconv.Attributes(
+		span.Attributes(),
+		attribute.Bool("bool_key", true),
+		attribute.String("string_key1", "string value 1"),
+		attribute.Float64("float_key", math.Pi),
+		attribute.Int64("int_key", 42),
+		attribute.String("string_key2", "string value 2"),
+	)
+	assert.Equal(t, wantSpans, spans)
 }

@@ -8,13 +8,18 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
-type bpfSliceArrayBuff struct{ Buff [1024]uint8 }
+type bpfSliceArrayBuff struct {
+	_    structs.HostLayout
+	Buff [1024]uint8
+}
 
 type bpfSpanContext struct {
+	_          structs.HostLayout
 	TraceID    [16]uint8
 	SpanID     [8]uint8
 	TraceFlags uint8
@@ -22,7 +27,9 @@ type bpfSpanContext struct {
 }
 
 type bpfUprobeDataT struct {
+	_    structs.HostLayout
 	Span struct {
+		_           structs.HostLayout
 		StartTime   uint64
 		EndTime     uint64
 		Sc          bpfSpanContext
@@ -73,14 +80,16 @@ func loadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type bpfSpecs struct {
 	bpfProgramSpecs
 	bpfMapSpecs
+	bpfVariableSpecs
 }
 
-// bpfSpecs contains programs before they are loaded into the kernel.
+// bpfProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
-	UprobeServerHandlerServeHTTP         *ebpf.ProgramSpec `ebpf:"uprobe_serverHandler_ServeHTTP"`
-	UprobeServerHandlerServeHTTP_Returns *ebpf.ProgramSpec `ebpf:"uprobe_serverHandler_ServeHTTP_Returns"`
+	UprobeServerHandlerServeHTTP                       *ebpf.ProgramSpec `ebpf:"uprobe_serverHandler_ServeHTTP"`
+	UprobeServerHandlerServeHTTP_Returns               *ebpf.ProgramSpec `ebpf:"uprobe_serverHandler_ServeHTTP_Returns"`
+	UprobeTextprotoReaderReadContinuedLineSliceReturns *ebpf.ProgramSpec `ebpf:"uprobe_textproto_Reader_readContinuedLineSlice_Returns"`
 }
 
 // bpfMapSpecs contains maps before they are loaded into the kernel.
@@ -91,10 +100,40 @@ type bpfMapSpecs struct {
 	Events                     *ebpf.MapSpec `ebpf:"events"`
 	GoContextToSc              *ebpf.MapSpec `ebpf:"go_context_to_sc"`
 	GolangMapbucketStorageMap  *ebpf.MapSpec `ebpf:"golang_mapbucket_storage_map"`
+	HttpServerContextHeaders   *ebpf.MapSpec `ebpf:"http_server_context_headers"`
 	HttpServerUprobeStorageMap *ebpf.MapSpec `ebpf:"http_server_uprobe_storage_map"`
 	HttpServerUprobes          *ebpf.MapSpec `ebpf:"http_server_uprobes"`
+	ProbeActiveSamplerMap      *ebpf.MapSpec `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap          *ebpf.MapSpec `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap          *ebpf.MapSpec `ebpf:"slice_array_buff_map"`
 	TrackedSpansBySc           *ebpf.MapSpec `ebpf:"tracked_spans_by_sc"`
+}
+
+// bpfVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type bpfVariableSpecs struct {
+	BucketsPtrPos              *ebpf.VariableSpec `ebpf:"buckets_ptr_pos"`
+	CtxPtrPos                  *ebpf.VariableSpec `ebpf:"ctx_ptr_pos"`
+	EndAddr                    *ebpf.VariableSpec `ebpf:"end_addr"`
+	HeadersPtrPos              *ebpf.VariableSpec `ebpf:"headers_ptr_pos"`
+	Hex                        *ebpf.VariableSpec `ebpf:"hex"`
+	HostPos                    *ebpf.VariableSpec `ebpf:"host_pos"`
+	MethodPtrPos               *ebpf.VariableSpec `ebpf:"method_ptr_pos"`
+	PatStrPos                  *ebpf.VariableSpec `ebpf:"pat_str_pos"`
+	PathPtrPos                 *ebpf.VariableSpec `ebpf:"path_ptr_pos"`
+	PatternPathPublicSupported *ebpf.VariableSpec `ebpf:"pattern_path_public_supported"`
+	PatternPathSupported       *ebpf.VariableSpec `ebpf:"pattern_path_supported"`
+	ProtoPos                   *ebpf.VariableSpec `ebpf:"proto_pos"`
+	RemoteAddrPos              *ebpf.VariableSpec `ebpf:"remote_addr_pos"`
+	ReqPatPos                  *ebpf.VariableSpec `ebpf:"req_pat_pos"`
+	ReqPatternPos              *ebpf.VariableSpec `ebpf:"req_pattern_pos"`
+	ReqPtrPos                  *ebpf.VariableSpec `ebpf:"req_ptr_pos"`
+	StartAddr                  *ebpf.VariableSpec `ebpf:"start_addr"`
+	StatusCodePos              *ebpf.VariableSpec `ebpf:"status_code_pos"`
+	SwissMapsUsed              *ebpf.VariableSpec `ebpf:"swiss_maps_used"`
+	TotalCpus                  *ebpf.VariableSpec `ebpf:"total_cpus"`
+	UrlPtrPos                  *ebpf.VariableSpec `ebpf:"url_ptr_pos"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -103,6 +142,7 @@ type bpfMapSpecs struct {
 type bpfObjects struct {
 	bpfPrograms
 	bpfMaps
+	bpfVariables
 }
 
 func (o *bpfObjects) Close() error {
@@ -120,8 +160,11 @@ type bpfMaps struct {
 	Events                     *ebpf.Map `ebpf:"events"`
 	GoContextToSc              *ebpf.Map `ebpf:"go_context_to_sc"`
 	GolangMapbucketStorageMap  *ebpf.Map `ebpf:"golang_mapbucket_storage_map"`
+	HttpServerContextHeaders   *ebpf.Map `ebpf:"http_server_context_headers"`
 	HttpServerUprobeStorageMap *ebpf.Map `ebpf:"http_server_uprobe_storage_map"`
 	HttpServerUprobes          *ebpf.Map `ebpf:"http_server_uprobes"`
+	ProbeActiveSamplerMap      *ebpf.Map `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap          *ebpf.Map `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap          *ebpf.Map `ebpf:"slice_array_buff_map"`
 	TrackedSpansBySc           *ebpf.Map `ebpf:"tracked_spans_by_sc"`
 }
@@ -132,25 +175,57 @@ func (m *bpfMaps) Close() error {
 		m.Events,
 		m.GoContextToSc,
 		m.GolangMapbucketStorageMap,
+		m.HttpServerContextHeaders,
 		m.HttpServerUprobeStorageMap,
 		m.HttpServerUprobes,
+		m.ProbeActiveSamplerMap,
+		m.SamplersConfigMap,
 		m.SliceArrayBuffMap,
 		m.TrackedSpansBySc,
 	)
+}
+
+// bpfVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfVariables struct {
+	BucketsPtrPos              *ebpf.Variable `ebpf:"buckets_ptr_pos"`
+	CtxPtrPos                  *ebpf.Variable `ebpf:"ctx_ptr_pos"`
+	EndAddr                    *ebpf.Variable `ebpf:"end_addr"`
+	HeadersPtrPos              *ebpf.Variable `ebpf:"headers_ptr_pos"`
+	Hex                        *ebpf.Variable `ebpf:"hex"`
+	HostPos                    *ebpf.Variable `ebpf:"host_pos"`
+	MethodPtrPos               *ebpf.Variable `ebpf:"method_ptr_pos"`
+	PatStrPos                  *ebpf.Variable `ebpf:"pat_str_pos"`
+	PathPtrPos                 *ebpf.Variable `ebpf:"path_ptr_pos"`
+	PatternPathPublicSupported *ebpf.Variable `ebpf:"pattern_path_public_supported"`
+	PatternPathSupported       *ebpf.Variable `ebpf:"pattern_path_supported"`
+	ProtoPos                   *ebpf.Variable `ebpf:"proto_pos"`
+	RemoteAddrPos              *ebpf.Variable `ebpf:"remote_addr_pos"`
+	ReqPatPos                  *ebpf.Variable `ebpf:"req_pat_pos"`
+	ReqPatternPos              *ebpf.Variable `ebpf:"req_pattern_pos"`
+	ReqPtrPos                  *ebpf.Variable `ebpf:"req_ptr_pos"`
+	StartAddr                  *ebpf.Variable `ebpf:"start_addr"`
+	StatusCodePos              *ebpf.Variable `ebpf:"status_code_pos"`
+	SwissMapsUsed              *ebpf.Variable `ebpf:"swiss_maps_used"`
+	TotalCpus                  *ebpf.Variable `ebpf:"total_cpus"`
+	UrlPtrPos                  *ebpf.Variable `ebpf:"url_ptr_pos"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
-	UprobeServerHandlerServeHTTP         *ebpf.Program `ebpf:"uprobe_serverHandler_ServeHTTP"`
-	UprobeServerHandlerServeHTTP_Returns *ebpf.Program `ebpf:"uprobe_serverHandler_ServeHTTP_Returns"`
+	UprobeServerHandlerServeHTTP                       *ebpf.Program `ebpf:"uprobe_serverHandler_ServeHTTP"`
+	UprobeServerHandlerServeHTTP_Returns               *ebpf.Program `ebpf:"uprobe_serverHandler_ServeHTTP_Returns"`
+	UprobeTextprotoReaderReadContinuedLineSliceReturns *ebpf.Program `ebpf:"uprobe_textproto_Reader_readContinuedLineSlice_Returns"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
 		p.UprobeServerHandlerServeHTTP,
 		p.UprobeServerHandlerServeHTTP_Returns,
+		p.UprobeTextprotoReaderReadContinuedLineSliceReturns,
 	)
 }
 

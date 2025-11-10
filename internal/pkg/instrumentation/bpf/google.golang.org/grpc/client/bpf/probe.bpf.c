@@ -12,31 +12,30 @@ char __license[] SEC("license") = "Dual MIT/GPL";
 
 #define MAX_SIZE 50
 #define MAX_CONCURRENT 50
+#define MAX_ERROR_LEN 128
 
-struct grpc_request_t
-{
+struct grpc_request_t {
     BASE_SPAN_PROPERTIES
+    char err_msg[MAX_ERROR_LEN];
     char method[MAX_SIZE];
     char target[MAX_SIZE];
+    u32 status_code;
 };
 
-struct hpack_header_field
-{
+struct hpack_header_field {
     struct go_string name;
     struct go_string value;
     bool sensitive;
 };
 
-struct
-{
+struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, void *);
     __type(value, struct grpc_request_t);
     __uint(max_entries, MAX_CONCURRENT);
 } grpc_events SEC(".maps");
 
-struct
-{
+struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, u32);
     __type(value, struct span_context);
@@ -48,12 +47,17 @@ volatile const u64 clientconn_target_ptr_pos;
 volatile const u64 httpclient_nextid_pos;
 volatile const u64 headerFrame_streamid_pos;
 volatile const u64 headerFrame_hf_pos;
+volatile const u64 error_status_pos;
+volatile const u64 status_s_pos;
+volatile const u64 status_message_pos;
+volatile const u64 status_code_pos;
+
+volatile const bool write_status_supported;
 
 // This instrumentation attaches uprobe to the following function:
 // func (cc *ClientConn) Invoke(ctx context.Context, method string, args, reply interface{}, opts ...CallOption) error
 SEC("uprobe/ClientConn_Invoke")
-int uprobe_ClientConn_Invoke(struct pt_regs *ctx)
-{
+int uprobe_ClientConn_Invoke(struct pt_regs *ctx) {
     // positions
     u64 clientconn_pos = 1;
     u64 method_ptr_pos = 4;
@@ -63,10 +67,9 @@ int uprobe_ClientConn_Invoke(struct pt_regs *ctx)
     get_Go_context(ctx, 2, 0, true, &go_context);
 
     // Get key
-    void *key = get_consistent_key(ctx, go_context.data);
+    void *key = (void *)GOROUTINE(ctx);
     void *grpcReq_ptr = bpf_map_lookup_elem(&grpc_events, &key);
-    if (grpcReq_ptr != NULL)
-    {
+    if (grpcReq_ptr != NULL) {
         bpf_printk("uprobe/ClientConn_Invoke already tracked with the current context");
         return 0;
     }
@@ -83,8 +86,9 @@ int uprobe_ClientConn_Invoke(struct pt_regs *ctx)
 
     // Read ClientConn.Target
     void *clientconn_ptr = get_argument(ctx, clientconn_pos);
-    if (!get_go_string_from_user_ptr((void*)(clientconn_ptr + clientconn_target_ptr_pos), grpcReq.target, sizeof(grpcReq.target)))
-    {
+    if (!get_go_string_from_user_ptr((void *)(clientconn_ptr + clientconn_target_ptr_pos),
+                                     grpcReq.target,
+                                     sizeof(grpcReq.target))) {
         bpf_printk("target write failed, aborting ebpf probe");
         return 0;
     }
@@ -105,18 +109,71 @@ int uprobe_ClientConn_Invoke(struct pt_regs *ctx)
     return 0;
 }
 
-UPROBE_RETURN(ClientConn_Invoke, struct grpc_request_t, grpc_events, events, 3, 0, true)
+// This instrumentation attaches uprobe to the following function:
+// func (cc *ClientConn) Invoke(ctx context.Context, method string, args, reply interface{}, opts ...CallOption) error
+SEC("uprobe/ClientConn_Invoke")
+int uprobe_ClientConn_Invoke_Returns(struct pt_regs *ctx) {
+    void *key = (void *)GOROUTINE(ctx);
+    struct grpc_request_t *grpc_span = bpf_map_lookup_elem(&grpc_events, &key);
+    if (grpc_span == NULL) {
+        bpf_printk("event is NULL in ret probe");
+        return 0;
+    }
+
+    if (!write_status_supported) {
+        goto done;
+    }
+    // Getting the returned response (error)
+    // The status code is embedded 3 layers deep:
+    // Invoke() error
+    // the `error` interface concrete type here is a gRPC `internal.Error` struct
+    // type Error struct {
+    //   s *Status
+    // }
+    // The `Error` struct embeds a `Status` proto object
+    // type Status struct {
+    //   s *Status
+    // }
+    // The `Status` proto object contains a `Code` int32 field, which is what we want
+    // type Status struct {
+    //     Code int32
+    //     Message string
+    //     Details []*anypb.Any
+    // }
+    void *resp_ptr = get_argument(ctx, 2);
+    if (resp_ptr == 0) {
+        // err == nil
+        goto done;
+    }
+    void *status_ptr = 0;
+    // get `s` (Status pointer field) from Error struct
+    bpf_probe_read_user(&status_ptr, sizeof(status_ptr), (void *)(resp_ptr + error_status_pos));
+    // get `s` field from Status object pointer
+    void *s_ptr = 0;
+    bpf_probe_read_user(&s_ptr, sizeof(s_ptr), (void *)(status_ptr + status_s_pos));
+    // Get status code from Status.s pointer
+    bpf_probe_read_user(
+        &grpc_span->status_code, sizeof(grpc_span->status_code), (void *)(s_ptr + status_code_pos));
+    get_go_string_from_user_ptr(
+        (void *)(s_ptr + status_message_pos), grpc_span->err_msg, sizeof(grpc_span->err_msg));
+
+done:
+    grpc_span->end_time = bpf_ktime_get_ns();
+    output_span_event(ctx, grpc_span, sizeof(*grpc_span), &grpc_span->sc);
+    stop_tracking_span(&grpc_span->sc, &grpc_span->psc);
+    bpf_map_delete_elem(&grpc_events, &key);
+    return 0;
+}
 
 // func (l *loopyWriter) headerHandler(h *headerFrame) error
 SEC("uprobe/loopyWriter_headerHandler")
-int uprobe_LoopyWriter_HeaderHandler(struct pt_regs *ctx)
-{
+int uprobe_LoopyWriter_HeaderHandler(struct pt_regs *ctx) {
     void *headerFrame_ptr = get_argument(ctx, 2);
     u32 stream_id = 0;
-    bpf_probe_read(&stream_id, sizeof(stream_id), (void *)(headerFrame_ptr + (headerFrame_streamid_pos)));
+    bpf_probe_read(
+        &stream_id, sizeof(stream_id), (void *)(headerFrame_ptr + (headerFrame_streamid_pos)));
     void *sc_ptr = bpf_map_lookup_elem(&streamid_to_span_contexts, &stream_id);
-    if (sc_ptr == NULL)
-    {
+    if (sc_ptr == NULL) {
         return 0;
     }
 
@@ -150,8 +207,7 @@ done:
 
 SEC("uprobe/http2Client_NewStream")
 // func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (*Stream, error)
-int uprobe_http2Client_NewStream(struct pt_regs *ctx)
-{
+int uprobe_http2Client_NewStream(struct pt_regs *ctx) {
     struct go_iface go_context = {0};
     get_Go_context(ctx, 2, 0, true, &go_context);
     void *httpclient_ptr = get_argument(ctx, 1);

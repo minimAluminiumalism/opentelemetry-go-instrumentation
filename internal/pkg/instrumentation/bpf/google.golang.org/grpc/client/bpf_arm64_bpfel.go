@@ -8,23 +8,30 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
 
 type bpfGrpcRequestT struct {
-	StartTime uint64
-	EndTime   uint64
-	Sc        bpfSpanContext
-	Psc       bpfSpanContext
-	Method    [50]int8
-	Target    [50]int8
-	_         [4]byte
+	_          structs.HostLayout
+	StartTime  uint64
+	EndTime    uint64
+	Sc         bpfSpanContext
+	Psc        bpfSpanContext
+	ErrMsg     [128]int8
+	Method     [50]int8
+	Target     [50]int8
+	StatusCode uint32
 }
 
-type bpfSliceArrayBuff struct{ Buff [1024]uint8 }
+type bpfSliceArrayBuff struct {
+	_    structs.HostLayout
+	Buff [1024]uint8
+}
 
 type bpfSpanContext struct {
+	_          structs.HostLayout
 	TraceID    [16]uint8
 	SpanID     [8]uint8
 	TraceFlags uint8
@@ -66,9 +73,10 @@ func loadBpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
 type bpfSpecs struct {
 	bpfProgramSpecs
 	bpfMapSpecs
+	bpfVariableSpecs
 }
 
-// bpfSpecs contains programs before they are loaded into the kernel.
+// bpfProgramSpecs contains programs before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
@@ -86,9 +94,30 @@ type bpfMapSpecs struct {
 	Events                 *ebpf.MapSpec `ebpf:"events"`
 	GoContextToSc          *ebpf.MapSpec `ebpf:"go_context_to_sc"`
 	GrpcEvents             *ebpf.MapSpec `ebpf:"grpc_events"`
+	ProbeActiveSamplerMap  *ebpf.MapSpec `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap      *ebpf.MapSpec `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap      *ebpf.MapSpec `ebpf:"slice_array_buff_map"`
 	StreamidToSpanContexts *ebpf.MapSpec `ebpf:"streamid_to_span_contexts"`
 	TrackedSpansBySc       *ebpf.MapSpec `ebpf:"tracked_spans_by_sc"`
+}
+
+// bpfVariableSpecs contains global variables before they are loaded into the kernel.
+//
+// It can be passed ebpf.CollectionSpec.Assign.
+type bpfVariableSpecs struct {
+	ClientconnTargetPtrPos *ebpf.VariableSpec `ebpf:"clientconn_target_ptr_pos"`
+	EndAddr                *ebpf.VariableSpec `ebpf:"end_addr"`
+	ErrorStatusPos         *ebpf.VariableSpec `ebpf:"error_status_pos"`
+	HeaderFrameHfPos       *ebpf.VariableSpec `ebpf:"headerFrame_hf_pos"`
+	HeaderFrameStreamidPos *ebpf.VariableSpec `ebpf:"headerFrame_streamid_pos"`
+	Hex                    *ebpf.VariableSpec `ebpf:"hex"`
+	HttpclientNextidPos    *ebpf.VariableSpec `ebpf:"httpclient_nextid_pos"`
+	StartAddr              *ebpf.VariableSpec `ebpf:"start_addr"`
+	StatusCodePos          *ebpf.VariableSpec `ebpf:"status_code_pos"`
+	StatusMessagePos       *ebpf.VariableSpec `ebpf:"status_message_pos"`
+	StatusS_pos            *ebpf.VariableSpec `ebpf:"status_s_pos"`
+	TotalCpus              *ebpf.VariableSpec `ebpf:"total_cpus"`
+	WriteStatusSupported   *ebpf.VariableSpec `ebpf:"write_status_supported"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -97,6 +126,7 @@ type bpfMapSpecs struct {
 type bpfObjects struct {
 	bpfPrograms
 	bpfMaps
+	bpfVariables
 }
 
 func (o *bpfObjects) Close() error {
@@ -114,6 +144,8 @@ type bpfMaps struct {
 	Events                 *ebpf.Map `ebpf:"events"`
 	GoContextToSc          *ebpf.Map `ebpf:"go_context_to_sc"`
 	GrpcEvents             *ebpf.Map `ebpf:"grpc_events"`
+	ProbeActiveSamplerMap  *ebpf.Map `ebpf:"probe_active_sampler_map"`
+	SamplersConfigMap      *ebpf.Map `ebpf:"samplers_config_map"`
 	SliceArrayBuffMap      *ebpf.Map `ebpf:"slice_array_buff_map"`
 	StreamidToSpanContexts *ebpf.Map `ebpf:"streamid_to_span_contexts"`
 	TrackedSpansBySc       *ebpf.Map `ebpf:"tracked_spans_by_sc"`
@@ -125,10 +157,31 @@ func (m *bpfMaps) Close() error {
 		m.Events,
 		m.GoContextToSc,
 		m.GrpcEvents,
+		m.ProbeActiveSamplerMap,
+		m.SamplersConfigMap,
 		m.SliceArrayBuffMap,
 		m.StreamidToSpanContexts,
 		m.TrackedSpansBySc,
 	)
+}
+
+// bpfVariables contains all global variables after they have been loaded into the kernel.
+//
+// It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
+type bpfVariables struct {
+	ClientconnTargetPtrPos *ebpf.Variable `ebpf:"clientconn_target_ptr_pos"`
+	EndAddr                *ebpf.Variable `ebpf:"end_addr"`
+	ErrorStatusPos         *ebpf.Variable `ebpf:"error_status_pos"`
+	HeaderFrameHfPos       *ebpf.Variable `ebpf:"headerFrame_hf_pos"`
+	HeaderFrameStreamidPos *ebpf.Variable `ebpf:"headerFrame_streamid_pos"`
+	Hex                    *ebpf.Variable `ebpf:"hex"`
+	HttpclientNextidPos    *ebpf.Variable `ebpf:"httpclient_nextid_pos"`
+	StartAddr              *ebpf.Variable `ebpf:"start_addr"`
+	StatusCodePos          *ebpf.Variable `ebpf:"status_code_pos"`
+	StatusMessagePos       *ebpf.Variable `ebpf:"status_message_pos"`
+	StatusS_pos            *ebpf.Variable `ebpf:"status_s_pos"`
+	TotalCpus              *ebpf.Variable `ebpf:"total_cpus"`
+	WriteStatusSupported   *ebpf.Variable `ebpf:"write_status_supported"`
 }
 
 // bpfPrograms contains all programs after they have been loaded into the kernel.
